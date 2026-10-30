@@ -21,7 +21,9 @@ const COMMANDS: &[&str] = &[
     "deop",
     "devoice",
     "disconnect",
+    "filter",
     "help",
+    "ignore",
     "invite",
     "join",
     "kick",
@@ -40,6 +42,7 @@ const COMMANDS: &[&str] = &[
     "reconnect",
     "server",
     "topic",
+    "unignore",
     "voice",
     "whois",
 ];
@@ -52,6 +55,7 @@ const HELP: &[&str] = &[
     "/op, /deop, /voice, /devoice <nick>…, /whois <nick>, /names, /away [message], /nick <nick>",
     "/ctcp <nick> <command>, /quote <line> (also /raw), /clear",
     "/connect <server>, /reconnect, /disconnect [reason]",
+    "/ignore [nick|mask], /unignore <nick|mask>; /filter hides joins, parts and quits of people who haven't spoken lately",
     "Alt+Up/Down or Alt+1–9 switch buffers, Ctrl+Tab networks; Ctrl+J joins, Ctrl+W closes; Tab completes; F7 and F8 hide the nick list and sidebar.",
     "Any other /command is sent as a raw line: /whowas ruby sends WHOWAS ruby.",
 ];
@@ -476,6 +480,48 @@ impl App {
                 let config = self.networks[index].config.clone();
                 self.send(NetCommand::Connect(id, config));
             }
+            "ignore" if args.is_empty() => {
+                let ignores = &self.networks[index].state.ignores;
+                let text = if ignores.is_empty() {
+                    String::from("Ignoring no one on this network")
+                } else {
+                    format!("Ignoring {}", ignores.join(", "))
+                };
+                self.say(LineKind::Status, "•", text);
+            }
+            "ignore" | "unignore" => {
+                let state = &mut self.networks[index].state;
+                let mask = state.ignore_mask(args.split_whitespace().next().unwrap_or(""));
+                let present = state.ignores.contains(&mask);
+                let text = match (name == "ignore", present) {
+                    (true, true) => format!("Already ignoring {mask}"),
+                    (true, false) => {
+                        state.ignores.push(mask.clone());
+                        format!("Ignoring {mask}")
+                    }
+                    (false, true) => {
+                        state.ignores.retain(|ignored| *ignored != mask);
+                        format!("No longer ignoring {mask}")
+                    }
+                    (false, false) => format!("{mask} wasn't ignored"),
+                };
+                self.say(LineKind::Status, "•", text);
+                self.ignores_changed(index);
+            }
+            "filter" => {
+                self.smart_filter = match args {
+                    "on" => true,
+                    "off" => false,
+                    _ => !self.smart_filter,
+                };
+                let text = if self.smart_filter {
+                    "The smart filter hides joins, parts and quits of people who haven't spoken lately"
+                } else {
+                    "Showing every join, part and quit"
+                };
+                self.say(LineKind::Status, "•", text);
+                self.mark_chat();
+            }
             "clear" => {
                 self.networks[index].buffer_mut().clear();
                 self.selection = None;
@@ -535,7 +581,15 @@ impl App {
         let now = now_ms();
         for piece in split_message(text, budget) {
             let body = format!("{}{piece}{}", wrap.0, wrap.1);
-            let Ok(line) = serialize(&[], None, verb, &[target, &body]) else {
+            // Its echo and any refusal find it by label (IRCv3
+            // labeled-response); errors show where it shows.
+            let network = &mut self.networks[self.active];
+            let label = network.state.label(buffer.unwrap_or(network.active));
+            let tags: Vec<(&str, &str)> = label
+                .iter()
+                .map(|label| ("label", label.as_str()))
+                .collect();
+            let Ok(line) = serialize(&tags, None, verb, &[target, &body]) else {
                 self.say(LineKind::Error, "!", "That can't be sent.");
                 return;
             };
@@ -543,7 +597,7 @@ impl App {
             let network = &mut self.networks[self.active];
             match buffer {
                 Some(index) => {
-                    network.state.echo(index, kind, piece, now);
+                    network.state.echo(index, kind, piece, now, label);
                     network.state.buffers[index].anchor = None;
                 }
                 None => {
@@ -572,8 +626,42 @@ impl App {
         let (index, opened) = network.state.open(BufferKind::Query, nick);
         if opened {
             self.mark_sidebar();
+            self.sync_monitor(self.active);
         }
         self.activate_buffer(index);
+    }
+
+    /// Asks the server to watch exactly network `index`'s queries
+    /// (IRCv3 monitor).
+    pub(super) fn sync_monitor(&mut self, index: usize) {
+        let Some(network) = self.networks.get_mut(index) else {
+            return;
+        };
+        if !network.registered() || network.demo {
+            return;
+        }
+        let id = network.id;
+        for line in network.state.monitor_lines() {
+            self.send(NetCommand::Send(id, line));
+        }
+    }
+
+    /// Keeps network `index`'s ignore masks: a saved network's in
+    /// `networks.toml`, another's in the session.
+    fn ignores_changed(&mut self, index: usize) {
+        let network = &self.networks[index];
+        let ignores = network.state.ignores.clone();
+        match network.saved.clone() {
+            Some(name) => {
+                if let Some(saved) = self.saved.list.iter_mut().find(|saved| saved.name == name) {
+                    saved.ignores = ignores;
+                }
+                if let Err(error) = self.save_networks() {
+                    self.say(LineKind::Error, "!", error);
+                }
+            }
+            None => self.session_changed(),
+        }
     }
 
     /// Joins channels at once: their buffers open (DESIGN.md §10) and join
@@ -721,6 +809,7 @@ impl App {
             self.say(LineKind::Error, "!", "A line can't contain line breaks.");
         } else if self.can_send() {
             self.say(LineKind::Sent, "→", redact(&line));
+            let line = self.labeled(line);
             let id = self.networks[self.active].id;
             self.send(NetCommand::Send(id, line));
         }
@@ -729,8 +818,22 @@ impl App {
     /// Sends a line without showing it.
     fn send_raw_quietly(&mut self, line: String) {
         if self.can_send() {
+            let line = self.labeled(line);
             let id = self.networks[self.active].id;
             self.send(NetCommand::Send(id, line));
+        }
+    }
+
+    /// `line` with a label, so its response comes back to the shown buffer
+    /// (IRCv3 labeled-response); a line with tags of its own stays as is.
+    fn labeled(&mut self, line: String) -> String {
+        if line.starts_with('@') {
+            return line;
+        }
+        let network = &mut self.networks[self.active];
+        match network.state.label(network.active) {
+            Some(label) => format!("@label={label} {line}"),
+            None => line,
         }
     }
 

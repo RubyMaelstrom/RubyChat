@@ -366,6 +366,9 @@ pub struct App {
     prompt_message: Option<String>,
     show_sidebar: bool,
     show_nicks: bool,
+    /// Hide joins, parts, quits and nick changes of people who haven't
+    /// spoken lately (DESIGN.md §8.6); `/filter` toggles it.
+    smart_filter: bool,
     sidebar_scroll: f32,
     hover: Hover,
     /// What the chat view last showed, for finding what's under the pointer.
@@ -394,6 +397,8 @@ pub struct App {
     /// Why saved networks didn't load; they are then never saved over.
     saved_error: Option<String>,
     known_hosts: crate::config::known_hosts::KnownHosts,
+    /// Hosts to reach over TLS only (IRCv3 STS).
+    sts: crate::config::sts::StsPolicies,
     startup: startup::Startup,
     /// Restore and save the session: not for `--demo` or tests.
     keep_session: bool,
@@ -540,6 +545,7 @@ impl App {
             prompt_message: None,
             show_sidebar: true,
             show_nicks: true,
+            smart_filter: true,
             sidebar_scroll: 0.0,
             hover: Hover::default(),
             chat_frame: ChatFrame::default(),
@@ -557,6 +563,7 @@ impl App {
             saved: Default::default(),
             saved_error: None,
             known_hosts: Default::default(),
+            sts: Default::default(),
             startup: Default::default(),
             keep_session: !options.demo && !options.isolated,
             session_dirty: false,
@@ -1004,6 +1011,7 @@ impl App {
         self.mark_body();
         self.update_title();
         self.session_changed();
+        self.sync_monitor(self.active);
     }
 
     /// Whether anything is animating: only a connecting network's jewel,
@@ -1190,6 +1198,12 @@ impl App {
             // The UI shows what the user sends as they send it.
             NetEvent::Sent(..) => {}
             NetEvent::Certificate(id, problem) => self.certificate_refused(id, problem),
+            NetEvent::Caps(id, caps) => {
+                if let Some(network) = self.network_mut(id) {
+                    network.state.caps = caps;
+                }
+            }
+            NetEvent::Sts(id, sts) => self.sts_advertised(id, sts),
         }
     }
 
@@ -1239,6 +1253,10 @@ impl App {
             self.mark_header();
             self.mark_input();
             self.mark_nicks();
+            // Lines still waiting for their echo now show as undelivered.
+            if down {
+                self.mark_chat();
+            }
         }
     }
 
@@ -1283,6 +1301,10 @@ impl App {
         }
         self.alert(index, &applied.alerts);
         self.away_reply(message.command());
+        // Queries came or went, or the server just said it can MONITOR.
+        if applied.list || matches!(message.command(), "005" | "376" | "422") {
+            self.sync_monitor(index);
+        }
     }
 
     /// Marks what a change to network `index` touched. `badge` is the
@@ -1384,6 +1406,7 @@ impl App {
             chantypes: &state.isupport.chantypes,
             marker: buffer.marker,
             label_chars: buffer.label_chars,
+            filter: self.smart_filter,
         };
         // Whole pixels, so what's shown can move rather than repaint; the
         // remainder carries over.
@@ -1556,7 +1579,12 @@ impl App {
     fn copy(&mut self) {
         let text = if let Some(selection) = self.selection {
             let (start, end) = chat_view::ordered(selection.anchor, selection.focus);
-            chat_view::selected_text(self.networks[self.active].buffer().lines(), start, end)
+            chat_view::selected_text(
+                self.networks[self.active].buffer().lines(),
+                start,
+                end,
+                self.smart_filter,
+            )
         } else {
             let editor = self.editor();
             match editor.selection() {
@@ -1864,6 +1892,7 @@ impl App {
             trust_focus,
             trust_hover,
             start_saved_hover,
+            smart_filter,
             ..
         } = self;
         // What repainted below the strip: overlays paint over it, and only
@@ -2036,6 +2065,7 @@ impl App {
                             chantypes: &state.isupport.chantypes,
                             marker: buffer.marker,
                             label_chars: buffer.label_chars,
+                            filter: *smart_filter,
                         },
                         anchor: buffer.anchor,
                         selection: selection.map(|s| chat_view::ordered(s.anchor, s.focus)),
@@ -2160,6 +2190,7 @@ impl App {
 /// The header for the network's shown buffer.
 fn paint_header(painter: &mut Painter<'_>, rect: Rect, network: &Network) {
     let buffer = network.buffer();
+    let topic_text: Option<String>;
     let (name, detail, topic, placeholder) = match buffer.kind {
         BufferKind::Server => {
             let tls = if network.config.tls { "TLS" } else { "PLAIN" };
@@ -2195,12 +2226,37 @@ fn paint_header(painter: &mut Painter<'_>, rect: Rect, network: &Network) {
                 "No topic",
             )
         }
-        BufferKind::Query => (
-            buffer.name.as_str(),
-            String::from("private messages"),
-            None,
-            "Messages between you two",
-        ),
+        BufferKind::Query => {
+            // What's known of them (DESIGN.md §8.5): online or not
+            // (MONITOR), their account, and an away message or realname.
+            let peer = &buffer.peer;
+            let mut details = Vec::new();
+            match peer.online {
+                Some(true) => details.push(String::from("online")),
+                Some(false) => details.push(String::from("offline")),
+                None => {}
+            }
+            if let Some(account) = &peer.account {
+                details.push(format!("account {account}"));
+            }
+            if peer.away.is_some() {
+                details.push(String::from("away"));
+            }
+            if details.is_empty() {
+                details.push(String::from("private messages"));
+            }
+            topic_text = peer
+                .away
+                .as_ref()
+                .map(|away| format!("Away: {away}"))
+                .or_else(|| peer.realname.clone());
+            (
+                buffer.name.as_str(),
+                details.join(" · "),
+                topic_text.as_deref(),
+                "Messages between you two",
+            )
+        }
     };
     let view = HeaderView {
         name,

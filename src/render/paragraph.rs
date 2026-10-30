@@ -51,7 +51,7 @@ pub struct PlacedGlyph {
     pub space: bool,
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct Paragraph {
     pub glyphs: Vec<PlacedGlyph>,
     /// Each row's glyphs, and the unbroken line's x where the row starts.

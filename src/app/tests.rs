@@ -759,3 +759,114 @@ fn a_later_launchs_link_joins_on_the_network_already_open() {
     });
     assert_eq!(app.networks.len(), 2);
 }
+
+#[test]
+fn sent_lines_wait_for_their_labeled_echo() {
+    let mut app = app();
+    let id = registered(&mut app);
+    let caps = ["echo-message", "labeled-response", "batch"];
+    app.apply(NetEvent::Caps(
+        id,
+        caps.iter().map(|cap| cap.to_string()).collect(),
+    ));
+    receive(&mut app, id, ":ruby!u@h JOIN #rust");
+    let rust = network(&app).state.find("#rust").unwrap();
+    app.activate_buffer(rust);
+    sent(&app);
+    type_line(&mut app, "hello");
+    let lines = sent(&app);
+    let (label, rest) = lines[0]
+        .strip_prefix("@label=")
+        .and_then(|rest| rest.split_once(' '))
+        .expect("a labeled line");
+    assert_eq!(rest, "PRIVMSG #rust hello");
+    assert!(network(&app).buffer().lines().back().unwrap().pending);
+    receive(
+        &mut app,
+        id,
+        &format!("@label={label} :ruby!u@h PRIVMSG #rust :hello"),
+    );
+    let last = network(&app).buffer().lines().back().unwrap();
+    assert!(!last.pending && last.text == "hello");
+    // Other commands carry labels too, so replies come back here.
+    type_line(&mut app, "/whois alice");
+    assert!(sent(&app)[0].starts_with("@label=rc"));
+}
+
+#[test]
+fn ignore_and_filter_commands() {
+    let mut app = app();
+    let id = registered(&mut app);
+    type_line(&mut app, "/ignore Spammer");
+    assert_eq!(network(&app).state.ignores, ["spammer!*@*"]);
+    receive(&mut app, id, ":spammer!s@h PRIVMSG ruby :buy now");
+    assert!(network(&app).state.find("spammer").is_none());
+    type_line(&mut app, "/unignore spammer");
+    assert!(network(&app).state.ignores.is_empty());
+    assert!(app.smart_filter);
+    type_line(&mut app, "/filter");
+    assert!(!app.smart_filter);
+    type_line(&mut app, "/filter on");
+    assert!(app.smart_filter);
+}
+
+#[test]
+fn open_queries_are_monitored() {
+    let mut app = app();
+    let id = registered(&mut app);
+    receive(&mut app, id, ":srv 005 ruby MONITOR=10 :are supported");
+    sent(&app);
+    type_line(&mut app, "/query alice");
+    assert_eq!(sent(&app), ["MONITOR + alice"]);
+    let alice = network(&app).active;
+    app.close_buffer(alice);
+    assert_eq!(sent(&app), ["MONITOR - alice"]);
+}
+
+#[test]
+fn sts_policies_upgrade_later_connections() {
+    use crate::net::Sts;
+    let mut app = app();
+    let id = app.add_network(
+        String::from("Test"),
+        ConnectConfig::new("irc.test", 6667, false, "ruby"),
+    );
+    // The server's upgrade policy took the connection to TLS.
+    app.apply(NetEvent::Sts(
+        id,
+        Sts {
+            host: String::from("irc.test"),
+            port: 6697,
+            duration: None,
+            upgraded: true,
+        },
+    ));
+    let config = &network(&app).config;
+    assert!(config.tls && config.port == 6697);
+    // Its persistence policy makes the next insecure address secure.
+    app.apply(NetEvent::Sts(
+        id,
+        Sts {
+            host: String::from("irc.test"),
+            port: 6697,
+            duration: Some(3600),
+            upgraded: false,
+        },
+    ));
+    app.open_server(
+        super::commands::parse_server("irc://IRC.test:6667").unwrap(),
+        None,
+    );
+    let connect = app
+        .sent
+        .borrow()
+        .iter()
+        .rev()
+        .find_map(|command| match command {
+            NetCommand::Connect(_, config) => Some(config.clone()),
+            _ => None,
+        })
+        .unwrap();
+    assert!(connect.tls);
+    assert_eq!(connect.port, 6697);
+}

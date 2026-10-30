@@ -57,6 +57,21 @@ pub enum NetEvent {
     Lag(NetworkId, Duration),
     /// A server's certificate wasn't trusted; the connection stopped.
     Certificate(NetworkId, Box<CertificateProblem>),
+    /// The capabilities enabled now.
+    Caps(NetworkId, Vec<String>),
+    /// An STS policy the server advertised.
+    Sts(NetworkId, Sts),
+}
+
+/// An STS policy (IRCv3 STS): the connection was `upgraded` to TLS on
+/// `port`, or a secure connection keeps the policy for `duration` seconds
+/// from now (0 removes it).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Sts {
+    pub host: String,
+    pub port: u16,
+    pub duration: Option<u64>,
+    pub upgraded: bool,
 }
 
 /// A certificate the network's policy refused, for the trust prompt
@@ -586,6 +601,8 @@ mod tests {
                 NetEvent::Sent(_, line) => println!("> {line}"),
                 NetEvent::Lag(_, lag) => println!("lag {lag:?}"),
                 NetEvent::Certificate(_, problem) => println!("! {problem:?}"),
+                NetEvent::Caps(_, caps) => println!("caps {caps:?}"),
+                NetEvent::Sts(_, sts) => println!("sts {sts:?}"),
             }
         }
         net.send(NetCommand::Disconnect(

@@ -3,4 +3,5 @@
 pub mod known_hosts;
 pub mod networks;
 pub mod session;
+pub mod sts;
 pub mod toml;

@@ -266,7 +266,9 @@ pub fn paint_sidebar(painter: &mut Painter<'_>, layout: &SidebarLayout, view: &S
                     painter.fill_rect(*row, HOVER.with_alpha(150));
                     painter.fill_rect(Rect::new(row.x, row.y, 1.0, row.height), CYAN);
                 }
-                let left = buffer.kind == BufferKind::Channel && !buffer.joined;
+                // Channels you've left, and people MONITOR says are offline.
+                let left = (buffer.kind == BufferKind::Channel && !buffer.joined)
+                    || (buffer.kind == BufferKind::Query && buffer.peer.online == Some(false));
                 let color = if left {
                     DISABLED
                 } else if active || buffer.activity >= Activity::Messages {

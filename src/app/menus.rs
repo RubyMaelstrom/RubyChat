@@ -423,8 +423,12 @@ impl App {
             return;
         };
         let (start, end) = chat_view::ordered(selection.anchor, selection.focus);
-        let text =
-            chat_view::selected_text(self.networks[self.active].buffer().lines(), start, end);
+        let text = chat_view::selected_text(
+            self.networks[self.active].buffer().lines(),
+            start,
+            end,
+            self.smart_filter,
+        );
         let count = text.chars().count();
         let mut menu = Builder::default();
         menu.add(

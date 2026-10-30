@@ -135,6 +135,7 @@ fn paint_budgets() {
         chantypes: "#",
         marker: buffer.marker,
         label_chars: buffer.label_chars,
+        filter: true,
     };
 
     // Switching to the buffer paints everything below the strip.

@@ -20,6 +20,11 @@ pub struct Isupport {
     pub network: Option<String>,
     pub nicklen: Option<usize>,
     pub topiclen: Option<usize>,
+    /// MONITOR's limit on watched nicks (IRCv3 monitor); `Some(usize::MAX)`
+    /// when the server gives none, `None` without MONITOR.
+    pub monitor: Option<usize>,
+    /// WHO takes WHOX's `%fields` (IRCv3 whox).
+    pub whox: bool,
 }
 
 impl Default for Isupport {
@@ -38,6 +43,8 @@ impl Default for Isupport {
             network: None,
             nicklen: None,
             topiclen: None,
+            monitor: None,
+            whox: false,
         }
     }
 }
@@ -66,6 +73,8 @@ impl Isupport {
                     "NETWORK" => self.network = None,
                     "NICKLEN" => self.nicklen = None,
                     "TOPICLEN" => self.topiclen = None,
+                    "MONITOR" => self.monitor = None,
+                    "WHOX" => self.whox = false,
                     _ => {}
                 }
                 continue;
@@ -89,6 +98,9 @@ impl Isupport {
                 "NETWORK" => self.network = (!value.is_empty()).then(|| value.to_string()),
                 "NICKLEN" => self.nicklen = value.parse().ok(),
                 "TOPICLEN" => self.topiclen = value.parse().ok(),
+                "MONITOR" => self.monitor = Some(value.parse().unwrap_or(usize::MAX)),
+                // "Clients MUST accept WHOX tokens with a value."
+                "WHOX" => self.whox = true,
                 _ => {}
             }
         }

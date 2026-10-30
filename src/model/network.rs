@@ -4,7 +4,8 @@
 //! messages and numerics, with IRCv3 multi-prefix and userhost-in-names),
 //! and CTCP queries are answered at a bounded rate (DESIGN.md §6.8).
 
-use std::collections::HashMap;
+use std::borrow::Cow;
+use std::collections::{HashMap, VecDeque};
 
 use crate::irc::format::strip;
 use crate::irc::isupport::Isupport;
@@ -51,8 +52,102 @@ impl Applied {
     }
 }
 
+/// Whether someone who last spoke at `spoke` (0: never) is quiet at
+/// `time`.
+fn quiet(spoke: i64, time: i64) -> bool {
+    spoke == 0 || time.saturating_sub(spoke) >= QUIET_MS
+}
+
+/// Whether `text` matches `pattern`, where `*` stands for any run of
+/// characters and `?` for one.
+fn glob(pattern: &str, text: &str) -> bool {
+    let (pattern, text): (Vec<char>, Vec<char>) =
+        (pattern.chars().collect(), text.chars().collect());
+    let (mut p, mut t) = (0, 0);
+    // The last `*` seen, and where in `text` it was tried up to.
+    let mut star: Option<(usize, usize)> = None;
+    while t < text.len() {
+        match pattern.get(p) {
+            Some('*') => {
+                star = Some((p, t));
+                p += 1;
+            }
+            Some(&c) if c == '?' || c == text[t] => {
+                p += 1;
+                t += 1;
+            }
+            _ => match star {
+                Some((at, tried)) => {
+                    p = at + 1;
+                    t = tried + 1;
+                    star = Some((at, tried + 1));
+                }
+                None => return false,
+            },
+        }
+    }
+    pattern[p..].iter().all(|&c| c == '*')
+}
+
 /// JOIN lines stay this short, however many channels they carry.
 const JOIN_LINE_BYTES: usize = 400;
+/// Batches open at once, and messages one holds, at most; past these,
+/// messages are applied as they come (IRCv3 batch lets clients process
+/// them one by one).
+const MAX_BATCHES: usize = 32;
+const MAX_BATCH_MESSAGES: usize = 20_000;
+/// Lines awaiting their echo, and labels awaiting their response, at most.
+const MAX_PENDING: usize = 256;
+const MAX_LABELS: usize = 256;
+/// Someone who hasn't spoken for this long is quiet: the smart filter
+/// hides their joins, parts, quits and nick changes (DESIGN.md §8.6).
+pub const QUIET_MS: i64 = 15 * 60 * 1000;
+/// Channels larger than this aren't asked WHO after joining.
+const WHO_LIMIT: usize = 1000;
+/// The WHOX token on RubyChat's own WHO queries (IRCv3 whox: up to three
+/// digits).
+const WHO_TOKEN: &str = "152";
+/// Names a collapsed netsplit or netjoin line lists before counting.
+const COLLAPSED_NAMES: usize = 8;
+/// MONITOR lines stay this short.
+const MONITOR_LINE_BYTES: usize = 400;
+
+/// What came with a PRIVMSG or NOTICE besides its parameters.
+struct Incoming<'a> {
+    time: i64,
+    /// Its labeled-response label.
+    label: Option<&'a str>,
+    /// The sender's account (IRCv3 account-tag).
+    account: Option<String>,
+}
+
+/// A batch being received (IRCv3 batch).
+struct Batch {
+    kind: String,
+    params: Vec<String>,
+    /// The batch it is nested in.
+    parent: Option<String>,
+    /// The label its start carried (IRCv3 labeled-response).
+    label: Option<String>,
+    items: Vec<Item>,
+}
+
+enum Item {
+    Message(Message),
+    Batch(Batch),
+}
+
+/// A line sent while `echo-message` is on, until its echo confirms it.
+struct Pending {
+    label: Option<String>,
+    /// The target's casefolded name.
+    target: String,
+    kind: LineKind,
+    text: String,
+    /// The key of the buffer showing it, and its line there.
+    buffer: String,
+    line: u64,
+}
 
 pub struct NetworkState {
     /// Your nick as the server last confirmed it.
@@ -72,6 +167,24 @@ pub struct NetworkState {
     pub ctcp_replies: bool,
     /// PART's reason when none is given.
     pub part_message: String,
+    /// The capabilities enabled on the connection.
+    pub caps: Vec<String>,
+    batches: HashMap<String, Batch>,
+    pending: VecDeque<Pending>,
+    /// Labels awaiting their response, with the key of the buffer that
+    /// asked (empty for the server buffer).
+    labels: VecDeque<(String, String)>,
+    next_label: u64,
+    /// Where replies go while a labeled response is applied.
+    route: Option<usize>,
+    /// Channels to ask WHO about after joining, and the one being asked.
+    who_queue: VecDeque<String>,
+    who_running: Option<String>,
+    /// Nicks under MONITOR, casefolded.
+    monitored: Vec<String>,
+    /// Masks whose messages are dropped, casefolded (`nick!user@host`
+    /// with `*` and `?`).
+    pub ignores: Vec<String>,
 }
 
 impl NetworkState {
@@ -87,6 +200,16 @@ impl NetworkState {
             version: format!("RubyChat {}", env!("CARGO_PKG_VERSION")),
             ctcp_replies: true,
             part_message: String::new(),
+            caps: Vec::new(),
+            batches: HashMap::new(),
+            pending: VecDeque::new(),
+            labels: VecDeque::new(),
+            next_label: 0,
+            route: None,
+            who_queue: VecDeque::new(),
+            who_running: None,
+            monitored: Vec::new(),
+            ignores: Vec::new(),
         }
     }
 
@@ -160,15 +283,36 @@ impl NetworkState {
         lines
     }
 
-    /// The connection ended: channels are no longer joined.
+    /// The connection ended: channels are no longer joined, lines still
+    /// waiting for their echo weren't delivered, and what the server kept
+    /// for this connection is gone.
     pub fn disconnected(&mut self) {
         for buffer in &mut self.buffers {
-            if buffer.kind == BufferKind::Channel {
-                buffer.joined = false;
-                buffer.members.clear();
+            match buffer.kind {
+                BufferKind::Channel => {
+                    buffer.joined = false;
+                    buffer.members.clear();
+                }
+                BufferKind::Query => buffer.peer.online = None,
+                BufferKind::Server => {}
+            }
+        }
+        for pending in std::mem::take(&mut self.pending) {
+            if let Some(index) = self.buffer_by_key(&pending.buffer)
+                && let Some(line) = self.buffers[index].line_mut(pending.line)
+            {
+                line.pending = false;
+                line.failed = true;
             }
         }
         self.names.clear();
+        self.caps.clear();
+        self.batches.clear();
+        self.labels.clear();
+        self.route = None;
+        self.who_queue.clear();
+        self.who_running = None;
+        self.monitored.clear();
     }
 
     /// Whether `text` mentions your nick as a whole word.
@@ -219,17 +363,480 @@ impl NetworkState {
     }
 
     /// Shows something you sent (local echo): a message, action or notice
-    /// in `index`, as yours.
-    pub fn echo(&mut self, index: usize, kind: LineKind, text: &str, now: i64) {
+    /// in `index`, as yours. With `echo-message` it waits, dimmed, for the
+    /// server's echo, found by `label` or else by target and text.
+    pub fn echo(
+        &mut self,
+        index: usize,
+        kind: LineKind,
+        text: &str,
+        now: i64,
+        label: Option<String>,
+    ) {
+        let waits = self.has("echo-message");
         let mut line = Line::message(now, kind, self.nick.clone(), text);
         line.own = true;
-        if let Some(buffer) = self.buffers.get_mut(index) {
-            buffer.push(line);
+        line.pending = waits;
+        let Some(buffer) = self.buffers.get_mut(index) else {
+            return;
+        };
+        buffer.push(line);
+        if !waits {
+            return;
+        }
+        let pending = Pending {
+            label,
+            target: buffer.key.clone(),
+            kind,
+            text: text.to_string(),
+            buffer: buffer.key.clone(),
+            line: buffer.lines().back().map_or(0, |line| line.id),
+        };
+        if self.pending.len() == MAX_PENDING
+            && let Some(oldest) = self.pending.pop_front()
+            && let Some(index) = self.buffer_by_key(&oldest.buffer)
+            && let Some(line) = self.buffers[index].line_mut(oldest.line)
+        {
+            // Too many unconfirmed: the oldest stops waiting.
+            line.pending = false;
+        }
+        self.pending.push_back(pending);
+    }
+
+    pub fn has(&self, cap: &str) -> bool {
+        self.caps.iter().any(|enabled| enabled == cap)
+    }
+
+    /// Applies a message from the server: what changed, and anything to
+    /// send in reply.
+    pub fn apply(&mut self, message: &Message, now: i64) -> Applied {
+        let mut applied = Applied::default();
+        self.receive(message, now, &mut applied);
+        applied
+    }
+
+    /// A message in an open batch waits for the batch's end; others apply
+    /// now.
+    fn receive(&mut self, message: &Message, now: i64, applied: &mut Applied) {
+        if message.command().eq_ignore_ascii_case("BATCH") {
+            return self.on_batch(message, now, applied);
+        }
+        if let Some(reference) = message.tag("batch")
+            && let Some(batch) = self.batches.get_mut(reference.as_ref())
+            && batch.items.len() < MAX_BATCH_MESSAGES
+        {
+            batch.items.push(Item::Message(message.clone()));
+            return;
+        }
+        self.labeled(message, now, applied);
+    }
+
+    /// Applies a message, its replies routed to the buffer that asked when
+    /// it carries a label (IRCv3 labeled-response): one labeled message is
+    /// the whole response.
+    fn labeled(&mut self, message: &Message, now: i64, applied: &mut Applied) {
+        let label = message.tag("label").map(Cow::into_owned);
+        let route = label.as_deref().and_then(|label| self.take_label(label));
+        let saved = self.route;
+        if route.is_some() {
+            self.route = route;
+        }
+        self.apply_one(message, now, label.as_deref(), applied);
+        self.route = saved;
+    }
+
+    /// `BATCH +reference type params…` opens a batch; `BATCH -reference`
+    /// ends it, applying what it held, or hands it to the batch it is
+    /// nested in.
+    fn on_batch(&mut self, message: &Message, now: i64, applied: &mut Applied) {
+        let Some(reference) = message.param(0) else {
+            return;
+        };
+        if let Some(reference) = reference.strip_prefix('+') {
+            if reference.is_empty() || self.batches.len() >= MAX_BATCHES {
+                return;
+            }
+            let mut params = message.params().skip(1).map(str::to_string);
+            let kind = params.next().unwrap_or_default();
+            self.batches.insert(
+                reference.to_string(),
+                Batch {
+                    kind,
+                    params: params.collect(),
+                    parent: message.tag("batch").map(Cow::into_owned),
+                    label: message.tag("label").map(Cow::into_owned),
+                    items: Vec::new(),
+                },
+            );
+        } else if let Some(reference) = reference.strip_prefix('-')
+            && let Some(batch) = self.batches.remove(reference)
+        {
+            if let Some(parent) = batch.parent.as_deref()
+                && let Some(outer) = self.batches.get_mut(parent)
+            {
+                outer.items.push(Item::Batch(batch));
+                return;
+            }
+            self.finish(batch, now, applied);
         }
     }
 
-    pub fn apply(&mut self, message: &Message, now: i64) -> Applied {
-        let mut applied = Applied::default();
+    /// Applies a batch that ended: netsplits and netjoins collapse into a
+    /// line per buffer (IRCv3 netsplit batches); other types apply their
+    /// messages in order.
+    fn finish(&mut self, batch: Batch, now: i64, applied: &mut Applied) {
+        let route = batch
+            .label
+            .as_deref()
+            .and_then(|label| self.take_label(label));
+        let saved = self.route;
+        if route.is_some() {
+            self.route = route;
+        }
+        if matches!(batch.kind.as_str(), "netsplit" | "netjoin") {
+            self.collapse(batch, now, applied);
+        } else {
+            for item in batch.items {
+                match item {
+                    Item::Message(message) => self.labeled(&message, now, applied),
+                    Item::Batch(inner) => self.finish(inner, now, applied),
+                }
+            }
+        }
+        self.route = saved;
+    }
+
+    fn collapse(&mut self, batch: Batch, now: i64, applied: &mut Applied) {
+        let split = batch.kind == "netsplit";
+        let mut affected: Vec<(usize, Vec<String>)> = Vec::new();
+        let mut time = now;
+        for item in batch.items {
+            let Item::Message(message) = item else {
+                continue;
+            };
+            time = message_time(&message, now);
+            let Some(nick) = message.nick().map(str::to_string) else {
+                continue;
+            };
+            let buffers = match (split, message.command()) {
+                (true, command) if command.eq_ignore_ascii_case("QUIT") => self
+                    .remove_everywhere(&nick, applied)
+                    .into_iter()
+                    .map(|(index, _)| index)
+                    .collect::<Vec<_>>(),
+                (false, command) if command.eq_ignore_ascii_case("JOIN") => {
+                    let channel = message.param(0).unwrap_or("");
+                    self.add_member(&nick, channel, None, applied)
+                        .into_iter()
+                        .collect::<Vec<_>>()
+                }
+                // Anything else in the batch applies as usual.
+                _ => {
+                    self.labeled(&message, now, applied);
+                    continue;
+                }
+            };
+            for index in buffers {
+                match affected.iter_mut().find(|(at, _)| *at == index) {
+                    Some((_, nicks)) => nicks.push(nick.clone()),
+                    None => affected.push((index, vec![nick.clone()])),
+                }
+            }
+        }
+        let servers = batch.params.join(" ↔ ");
+        for (index, nicks) in affected {
+            let mut names = nicks
+                .iter()
+                .take(COLLAPSED_NAMES)
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(", ");
+            if nicks.len() > COLLAPSED_NAMES {
+                names.push_str(&format!(" and {} more", nicks.len() - COLLAPSED_NAMES));
+            }
+            let (prefix, verb) = if split {
+                ("←", "Netsplit")
+            } else {
+                ("→", "Netjoin")
+            };
+            let text = format!("{verb} {servers}: {names}");
+            self.event(index, time, prefix, text, applied);
+        }
+    }
+
+    /// A new label for a command sent from buffer `index`, while
+    /// labeled-response is on (it needs `batch`); the response comes back
+    /// to that buffer.
+    pub fn label(&mut self, index: usize) -> Option<String> {
+        if !(self.has("labeled-response") && self.has("batch")) {
+            return None;
+        }
+        self.next_label += 1;
+        let label = format!("rc{}", self.next_label);
+        let key = self
+            .buffers
+            .get(index)
+            .map(|buffer| buffer.key.clone())
+            .unwrap_or_default();
+        if self.labels.len() == MAX_LABELS {
+            self.labels.pop_front();
+        }
+        self.labels.push_back((label.clone(), key));
+        Some(label)
+    }
+
+    /// The buffer awaiting `label`'s response, which is now complete.
+    fn take_label(&mut self, label: &str) -> Option<usize> {
+        let position = self.labels.iter().position(|(sent, _)| sent == label)?;
+        let (_, key) = self.labels.remove(position)?;
+        if key.is_empty() {
+            return Some(0);
+        }
+        self.buffers
+            .iter()
+            .position(|buffer| buffer.kind != BufferKind::Server && buffer.key == key)
+            .or(Some(0))
+    }
+
+    /// Where a reply goes: the buffer that asked, when known, else the
+    /// server buffer.
+    fn reply_buffer(&self) -> usize {
+        self.route.unwrap_or(0)
+    }
+
+    /// The server confirmed a line you sent: it stops waiting, showing the
+    /// text as the server passed it on.
+    fn confirm(&mut self, pending: Pending, text: &str, applied: &mut Applied) {
+        if let Some(index) = self.buffer_by_key(&pending.buffer)
+            && let Some(line) = self.buffers[index].line_mut(pending.line)
+        {
+            line.pending = false;
+            if line.text != text {
+                line.text = text.to_string();
+            }
+            applied.touch(index);
+        }
+    }
+
+    /// The server refused a line you sent: the one with `label`, else the
+    /// oldest to `target`.
+    fn refuse(&mut self, label: Option<&str>, target: Option<&str>, applied: &mut Applied) {
+        let target = target.map(|target| self.fold(target));
+        let position = self
+            .pending
+            .iter()
+            .position(|pending| match (label, &target) {
+                (Some(label), _) => pending.label.as_deref() == Some(label),
+                (None, Some(target)) => pending.target == *target,
+                (None, None) => false,
+            });
+        if let Some(pending) = position.and_then(|at| self.pending.remove(at)) {
+            self.fail(pending, applied);
+        }
+    }
+
+    fn fail(&mut self, pending: Pending, applied: &mut Applied) {
+        if let Some(index) = self.buffer_by_key(&pending.buffer)
+            && let Some(line) = self.buffers[index].line_mut(pending.line)
+        {
+            line.pending = false;
+            line.failed = true;
+            applied.touch(index);
+        }
+    }
+
+    fn buffer_by_key(&self, key: &str) -> Option<usize> {
+        self.buffers
+            .iter()
+            .position(|buffer| buffer.kind != BufferKind::Server && buffer.key == key)
+    }
+
+    /// IRCv3 away-notify: `nick` went away with `message`, or came back.
+    fn set_away(&mut self, nick: &str, message: Option<&str>, applied: &mut Applied) {
+        let key = self.fold(nick);
+        for index in 1..self.buffers.len() {
+            let buffer = &mut self.buffers[index];
+            match buffer.kind {
+                BufferKind::Channel => {
+                    if buffer
+                        .members
+                        .set_away(nick, message.is_some(), &self.isupport)
+                    {
+                        applied.detail(index);
+                    }
+                }
+                BufferKind::Query if buffer.key == key => {
+                    buffer.peer.away = message.map(str::to_string);
+                    applied.detail(index);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// IRCv3 account-notify: `nick` logged in to `account`, or out.
+    fn set_account(&mut self, nick: &str, account: Option<String>, applied: &mut Applied) {
+        let key = self.fold(nick);
+        for index in 1..self.buffers.len() {
+            let buffer = &mut self.buffers[index];
+            match buffer.kind {
+                BufferKind::Channel => {
+                    if let Some(member) = buffer.members.get_mut(nick, &self.isupport) {
+                        member.account = account.clone();
+                    }
+                }
+                BufferKind::Query if buffer.key == key => {
+                    buffer.peer.account = account.clone();
+                    applied.detail(index);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// IRCv3 setname: `nick` has a new realname.
+    fn set_realname(&mut self, nick: &str, realname: &str, applied: &mut Applied) {
+        if let Some(index) = self.find(nick)
+            && self.buffers[index].kind == BufferKind::Query
+        {
+            self.buffers[index].peer.realname = Some(realname.to_string());
+            applied.detail(index);
+        }
+    }
+
+    /// A reply to RubyChat's own WHO about `channel`: `nick` is away or
+    /// not, and with WHOX, logged in to an account or not.
+    fn whoreply(
+        &mut self,
+        channel: &str,
+        nick: &str,
+        away: bool,
+        account: Option<Option<String>>,
+        applied: &mut Applied,
+    ) {
+        let Some(index) = self.find(channel) else {
+            return;
+        };
+        if let Some(member) = self.buffers[index].members.get_mut(nick, &self.isupport) {
+            member.away = away;
+            if let Some(account) = account {
+                member.account = account;
+            }
+            applied.detail(index);
+        }
+    }
+
+    /// Asks WHO about the next channel waiting, one at a time; WHOX asks
+    /// for flags and accounts (IRCv3 whox).
+    fn next_who(&mut self, applied: &mut Applied) {
+        while self.who_running.is_none() {
+            let Some(key) = self.who_queue.pop_front() else {
+                return;
+            };
+            let Some(buffer) = self.buffers.iter().find(|buffer| {
+                buffer.kind == BufferKind::Channel && buffer.key == key && buffer.joined
+            }) else {
+                continue;
+            };
+            let query = if self.isupport.whox {
+                format!("WHO {} %tcnfa,{WHO_TOKEN}", buffer.name)
+            } else {
+                format!("WHO {}", buffer.name)
+            };
+            applied.replies.push(query);
+            self.who_running = Some(key);
+        }
+    }
+
+    /// RPL_MONONLINE and RPL_MONOFFLINE: who of `targets` is on.
+    fn monitored_status(&mut self, online: bool, targets: &str, applied: &mut Applied) {
+        for target in targets.split(',').filter(|target| !target.is_empty()) {
+            let nick = split_source(target).nick;
+            if let Some(index) = self.find(nick)
+                && self.buffers[index].kind == BufferKind::Query
+            {
+                self.buffers[index].peer.online = Some(online);
+                applied.detail(index);
+                applied.list = true;
+            }
+        }
+    }
+
+    /// MONITOR lines that make the server watch exactly the open queries'
+    /// nicks, within its limit (IRCv3 monitor). Call it while registered.
+    pub fn monitor_lines(&mut self) -> Vec<String> {
+        let Some(limit) = self.isupport.monitor else {
+            return Vec::new();
+        };
+        let wanted: Vec<(&str, &str)> = self
+            .buffers
+            .iter()
+            .filter(|buffer| buffer.kind == BufferKind::Query)
+            .map(|buffer| (buffer.name.as_str(), buffer.key.as_str()))
+            .take(limit)
+            .collect();
+        let added: Vec<&str> = wanted
+            .iter()
+            .filter(|(_, key)| !self.monitored.iter().any(|monitored| monitored == key))
+            .map(|(name, _)| *name)
+            .collect();
+        let removed: Vec<&str> = self
+            .monitored
+            .iter()
+            .filter(|monitored| !wanted.iter().any(|(_, key)| key == monitored))
+            .map(String::as_str)
+            .collect();
+        let mut lines = Vec::new();
+        for (sign, nicks) in [("-", removed), ("+", added)] {
+            let mut line = String::new();
+            for nick in nicks {
+                if !line.is_empty() && line.len() + nick.len() + 1 > MONITOR_LINE_BYTES {
+                    lines.push(std::mem::take(&mut line));
+                }
+                if line.is_empty() {
+                    line = format!("MONITOR {sign} {nick}");
+                } else {
+                    line.push(',');
+                    line.push_str(nick);
+                }
+            }
+            if !line.is_empty() {
+                lines.push(line);
+            }
+        }
+        self.monitored = wanted.iter().map(|(_, key)| key.to_string()).collect();
+        lines
+    }
+
+    /// Whether `source` matches an ignore mask.
+    pub fn ignored(&self, source: &str) -> bool {
+        if self.ignores.is_empty() || !source.contains('!') {
+            return false;
+        }
+        let subject = self.fold(source);
+        self.ignores.iter().any(|mask| glob(mask, &subject))
+    }
+
+    /// The mask `/ignore` keeps for `pattern`: a bare nick ignores that nick
+    /// anywhere.
+    pub fn ignore_mask(&self, pattern: &str) -> String {
+        let mask = if pattern.contains(['!', '@']) {
+            pattern.to_string()
+        } else {
+            format!("{pattern}!*@*")
+        };
+        self.fold(&mask)
+    }
+
+    /// Applies one message, outside any batch; `label` is its
+    /// labeled-response label.
+    fn apply_one(
+        &mut self,
+        message: &Message,
+        now: i64,
+        label: Option<&str>,
+        applied: &mut Applied,
+    ) {
         let time = message_time(message, now);
         let command = message.command().to_ascii_uppercase();
         let source = message.source().unwrap_or("");
@@ -242,7 +849,7 @@ impl NetworkState {
                 if !param(0).is_empty() {
                     self.nick = param(0).to_string();
                 }
-                self.server_line(message, now, &mut applied);
+                self.server_line(message, now, applied);
             }
             "005" => {
                 let casemap = self.isupport.casemap;
@@ -253,34 +860,40 @@ impl NetworkState {
                 if self.isupport.casemap != casemap {
                     self.rekey();
                 }
-                self.server_line(message, now, &mut applied);
+                self.server_line(message, now, applied);
             }
             "JOIN" => {
                 let userhost = match (parts.user, parts.host) {
                     (Some(user), Some(host)) => format!(" ({user}@{host})"),
                     _ => String::new(),
                 };
-                self.on_join(from, &userhost, param(0), time, &mut applied);
+                // IRCv3 extended-join: the account (`*` for none), then the
+                // realname.
+                let account = (params.len() >= 3 && self.has("extended-join"))
+                    .then(|| param(1))
+                    .filter(|account| *account != "*")
+                    .map(str::to_string);
+                self.on_join(from, &userhost, param(0), account, time, applied);
             }
             "PART" => {
                 let reason = params
                     .get(1)
                     .map(|r| format!(" ({})", strip(r)))
                     .unwrap_or_default();
-                self.on_leave(from, param(0), time, &mut applied, |who| {
+                self.on_leave(from, param(0), time, false, applied, |who| {
                     format!("{who} left{reason}")
                 });
             }
             "KICK" => {
                 let (victim, reason) = (param(1), strip(param(2)).into_owned());
                 let kicker = from.to_string();
-                self.on_leave(victim, param(0), time, &mut applied, |who| {
+                self.on_leave(victim, param(0), time, true, applied, |who| {
                     format!("{kicker} kicked {who} ({reason})")
                 });
             }
-            "QUIT" => self.on_quit(from, &strip(param(0)), time, &mut applied),
-            "NICK" => self.on_nick(from, param(0), time, &mut applied),
-            "MODE" => self.on_mode(from, &params, time, &mut applied),
+            "QUIT" => self.on_quit(from, &strip(param(0)), time, applied),
+            "NICK" => self.on_nick(from, param(0), time, applied),
+            "MODE" => self.on_mode(from, &params, time, applied),
             "TOPIC" => {
                 if let Some(index) = self.find(param(0)) {
                     let topic = param(1).to_string();
@@ -293,7 +906,7 @@ impl NetworkState {
                     buffer.topic = (!topic.is_empty()).then_some(topic);
                     buffer.topic_by = Some(from.to_string());
                     applied.detail(index);
-                    self.event(index, time, "•", text, &mut applied);
+                    self.event(index, time, "•", text, applied);
                 }
             }
             "PRIVMSG" | "NOTICE" => self.on_message(
@@ -301,20 +914,80 @@ impl NetworkState {
                 from,
                 source,
                 &params,
-                time,
-                &mut applied,
+                Incoming {
+                    time,
+                    label,
+                    account: message.tag("account").map(Cow::into_owned),
+                },
+                applied,
             ),
+            "INVITE" if self.ignored(source) => {}
+            // IRCv3 invite-notify tells of invitations to others too.
+            "INVITE" if !self.is_me(param(0)) => {
+                let text = format!("{from} invited {} to {}", param(0), param(1));
+                let index = self.find(param(1)).unwrap_or(0);
+                self.event(index, time, "•", text, applied);
+            }
             "INVITE" => {
                 let text = format!("{from} invites you to {}", param(1));
-                self.event(0, time, "•", text, &mut applied);
+                self.event(0, time, "•", text, applied);
             }
+            // IRCv3 away-notify, account-notify, chghost and setname: state
+            // that shows in the nick list and query headers, not as lines.
+            "AWAY" => self.set_away(from, params.first().copied(), applied),
+            "ACCOUNT" => {
+                let account = Some(param(0))
+                    .filter(|account| !account.is_empty() && *account != "*")
+                    .map(str::to_string);
+                self.set_account(from, account, applied);
+            }
+            "SETNAME" => self.set_realname(from, param(0), applied),
+            "CHGHOST" | "ACK" => {}
+            // IRCv3 standard replies.
+            "FAIL" | "WARN" | "NOTE" => {
+                if command == "FAIL" {
+                    self.refuse(label, None, applied);
+                }
+                let description = strip(params.last().copied().unwrap_or("")).into_owned();
+                let text = match param(0) {
+                    "*" | "" => description,
+                    about => format!("{description} ({about})"),
+                };
+                let (kind, prefix) = match command.as_str() {
+                    "FAIL" => (LineKind::Error, "!"),
+                    "WARN" => (LineKind::Notice, "!"),
+                    _ => (LineKind::Server, "•"),
+                };
+                let index = self.reply_buffer();
+                self.add(index, Line::new(time, kind, prefix, text), applied);
+            }
+            // RubyChat's own WHO after joining is answered quietly: away
+            // flags (G) and, with WHOX, accounts.
+            "352" if self.who_running == Some(self.fold(param(1))) => {
+                let away = param(6).starts_with('G');
+                self.whoreply(param(1), param(5), away, None, applied);
+            }
+            "354" if param(1) == WHO_TOKEN => {
+                let account = Some(param(5))
+                    .filter(|account| *account != "0")
+                    .map(str::to_string);
+                let away = param(4).starts_with('G');
+                self.whoreply(param(2), param(3), away, Some(account), applied);
+            }
+            "315" if self.who_running == Some(self.fold(param(1))) => {
+                self.who_running = None;
+                self.next_who(applied);
+            }
+            // MONITOR (IRCv3 monitor): who among your queries is online.
+            "730" | "731" => self.monitored_status(command == "730", param(1), applied),
+            "732" | "733" => {}
             // RPL_TOPIC and RPL_TOPICWHOTIME.
             "332" => {
                 if let Some(index) = self.find(param(1)) {
                     self.buffers[index].topic = Some(param(2).to_string());
                     applied.detail(index);
                     let text = format!("Topic: {}", strip(param(2)));
-                    self.event(index, time, "•", text, &mut applied);
+                    self.event(index, time, "•", text, applied);
                 }
             }
             "333" => {
@@ -332,13 +1005,7 @@ impl NetworkState {
                         .unwrap_or_default();
                     self.buffers[index].topic_by = Some(setter.clone());
                     applied.detail(index);
-                    self.event(
-                        index,
-                        time,
-                        "•",
-                        format!("Set by {setter}{when}"),
-                        &mut applied,
-                    );
+                    self.event(index, time, "•", format!("Set by {setter}{when}"), applied);
                 }
             }
             // RPL_CHANNELMODEIS.
@@ -379,40 +1046,73 @@ impl NetworkState {
                         buffer.members.insert(member, &self.isupport);
                     }
                     applied.detail(index);
+                    // Away and account state comes from WHO (IRCv3
+                    // away-notify, account-notify).
+                    let (joined, count, key) =
+                        (buffer.joined, buffer.members.len(), buffer.key.clone());
+                    if joined
+                        && count <= WHO_LIMIT
+                        && (self.has("away-notify") || self.has("account-notify"))
+                    {
+                        if !self.who_queue.contains(&key) {
+                            self.who_queue.push_back(key);
+                        }
+                        self.next_who(applied);
+                    }
                 }
             }
             // WHOIS replies go to the buffer that asked.
             "301" | "311" | "312" | "313" | "317" | "318" | "319" | "320" | "330" | "338"
             | "378" | "379" | "671" | "276" => {
                 let index = self
-                    .whois_to
-                    .as_deref()
-                    .and_then(|name| self.find(name))
+                    .route
+                    .or_else(|| self.whois_to.as_deref().and_then(|name| self.find(name)))
                     .unwrap_or(0);
                 if command == "318" {
                     self.whois_to = None;
                 }
+                // What WHOIS says of someone you have a query with shows in
+                // its header.
+                if let Some(query) = self.find(param(1))
+                    && self.buffers[query].kind == BufferKind::Query
+                {
+                    let peer = &mut self.buffers[query].peer;
+                    match command.as_str() {
+                        "330" => peer.account = Some(param(2).to_string()),
+                        "301" => peer.away = Some(param(2).to_string()),
+                        "311" => peer.realname = Some(param(5).to_string()),
+                        _ => {}
+                    }
+                    applied.detail(query);
+                }
                 let text = whois_text(&command, &params);
-                self.event(index, time, "•", text, &mut applied);
+                self.event(index, time, "•", text, applied);
             }
             // Errors about a channel or nick show where they apply.
             "401" | "403" | "404" | "405" | "406" | "442" | "467" | "471" | "473" | "474"
             | "475" | "477" | "478" | "482" => {
-                let index = self.find(param(1)).unwrap_or(0);
+                // A message that can't be delivered stops waiting for its
+                // echo.
+                if label.is_some() {
+                    self.refuse(label, None, applied);
+                } else if matches!(command.as_str(), "401" | "404") {
+                    self.refuse(None, Some(param(1)), applied);
+                }
+                let index = self.find(param(1)).unwrap_or_else(|| self.reply_buffer());
                 if let Some(mut line) = describe(message, now) {
                     line.kind = LineKind::Error;
                     line.prefix = String::from("!");
-                    self.add(index, line, &mut applied);
+                    self.add(index, line, applied);
                 }
             }
-            _ => self.server_line(message, now, &mut applied),
+            _ => self.server_line(message, now, applied),
         }
-        applied
     }
 
     fn server_line(&mut self, message: &Message, now: i64, applied: &mut Applied) {
         if let Some(line) = describe(message, now) {
-            self.add(0, line, applied);
+            let index = self.reply_buffer();
+            self.add(index, line, applied);
         }
     }
 
@@ -432,6 +1132,7 @@ impl NetworkState {
         from: &str,
         userhost: &str,
         channel: &str,
+        account: Option<String>,
         time: i64,
         applied: &mut Applied,
     ) {
@@ -444,27 +1145,87 @@ impl NetworkState {
             applied.list = true;
             applied.detail(index);
             self.event(index, time, "→", format!("You joined {channel}"), applied);
-        } else if let Some(index) = self.find(channel) {
-            self.buffers[index]
-                .members
-                .insert(Member::new(from, ""), &self.isupport);
-            applied.detail(index);
-            self.event(
+        } else if let Some(index) = self.add_member(from, channel, account, applied) {
+            // Quiet until they speak (the smart filter).
+            let line = self.member_event(
                 index,
                 time,
                 "→",
                 format!("{from}{userhost} joined"),
+                true,
                 applied,
             );
+            if let Some(member) = self.buffers[index].members.get_mut(from, &self.isupport) {
+                member.join_line = Some((line, time));
+            }
         }
     }
 
-    /// PART and KICK: `who` leaves `channel`.
+    /// Adds `nick` to `channel`'s members; the channel's buffer, if open.
+    fn add_member(
+        &mut self,
+        nick: &str,
+        channel: &str,
+        account: Option<String>,
+        applied: &mut Applied,
+    ) -> Option<usize> {
+        let index = self.find(channel)?;
+        let mut member = Member::new(nick, "");
+        member.account = account;
+        self.buffers[index].members.insert(member, &self.isupport);
+        applied.detail(index);
+        Some(index)
+    }
+
+    /// Takes `nick` out of every channel; the buffers they were in (their
+    /// query too), with when they last spoke there.
+    fn remove_everywhere(&mut self, nick: &str, applied: &mut Applied) -> Vec<(usize, i64)> {
+        let key = self.fold(nick);
+        let mut found = Vec::new();
+        for index in 1..self.buffers.len() {
+            let buffer = &mut self.buffers[index];
+            let spoke = match buffer.kind {
+                BufferKind::Channel => buffer
+                    .members
+                    .remove(nick, &self.isupport)
+                    .map(|member| member.spoke),
+                // A query's quit always shows.
+                BufferKind::Query if buffer.key == key => Some(i64::MAX),
+                _ => None,
+            };
+            if let Some(spoke) = spoke {
+                applied.detail(index);
+                found.push((index, spoke));
+            }
+        }
+        found
+    }
+
+    /// An event about someone else; `quiet` ones the smart filter hides.
+    /// Its line's serial number.
+    fn member_event(
+        &mut self,
+        index: usize,
+        time: i64,
+        prefix: &str,
+        text: String,
+        quiet: bool,
+        applied: &mut Applied,
+    ) -> u64 {
+        let mut line = Line::new(time, LineKind::Event, prefix, text);
+        line.quiet = quiet;
+        self.add(index, line, applied);
+        self.buffers[index].lines().back().map_or(0, |line| line.id)
+    }
+
+    /// PART and KICK: `who` leaves `channel`. A part of someone quiet is
+    /// quiet; a kick always shows.
     fn on_leave(
         &mut self,
         who: &str,
         channel: &str,
         time: i64,
+        kick: bool,
         applied: &mut Applied,
         text: impl Fn(&str) -> String,
     ) {
@@ -479,25 +1240,21 @@ impl NetworkState {
             applied.list = true;
             self.event(index, time, "←", text("You"), applied);
         } else {
-            self.buffers[index].members.remove(who, &self.isupport);
-            self.event(index, time, "←", text(who), applied);
+            let spoke = self.buffers[index]
+                .members
+                .remove(who, &self.isupport)
+                .map_or(0, |member| member.spoke);
+            let quiet = !kick && quiet(spoke, time);
+            self.member_event(index, time, "←", text(who), quiet, applied);
         }
         applied.detail(index);
     }
 
     fn on_quit(&mut self, from: &str, reason: &str, time: i64, applied: &mut Applied) {
-        let key = self.fold(from);
-        for index in 1..self.buffers.len() {
-            let buffer = &mut self.buffers[index];
-            let present = match buffer.kind {
-                BufferKind::Channel => buffer.members.remove(from, &self.isupport).is_some(),
-                BufferKind::Query => buffer.key == key,
-                BufferKind::Server => false,
-            };
-            if present {
-                applied.detail(index);
-                self.event(index, time, "←", format!("{from} quit ({reason})"), applied);
-            }
+        for (index, spoke) in self.remove_everywhere(from, applied) {
+            let quiet = quiet(spoke, time);
+            let text = format!("{from} quit ({reason})");
+            self.member_event(index, time, "←", text, quiet, applied);
         }
     }
 
@@ -518,19 +1275,29 @@ impl NetworkState {
         };
         for index in 1..self.buffers.len() {
             let buffer = &mut self.buffers[index];
-            let present = match buffer.kind {
-                BufferKind::Channel => buffer.members.rename(from, new, &self.isupport),
+            // When they last spoke here, if they're here; a query's rename
+            // always shows.
+            let spoke = match buffer.kind {
+                BufferKind::Channel => {
+                    let spoke = buffer
+                        .members
+                        .get(from, &self.isupport)
+                        .map(|member| member.spoke);
+                    buffer.members.rename(from, new, &self.isupport);
+                    spoke
+                }
                 BufferKind::Query if buffer.key == old_key => {
                     buffer.name = new.to_string();
                     buffer.key = self.isupport.casemap.fold(new);
                     applied.list = true;
-                    true
+                    Some(i64::MAX)
                 }
-                _ => false,
+                _ => None,
             };
-            if present {
+            if let Some(spoke) = spoke {
                 applied.detail(index);
-                self.event(index, time, "•", text.clone(), applied);
+                let quiet = !mine && quiet(spoke, time);
+                self.member_event(index, time, "•", text.clone(), quiet, applied);
             }
         }
     }
@@ -588,12 +1355,17 @@ impl NetworkState {
         from: &str,
         source: &str,
         params: &[&str],
-        time: i64,
+        incoming: Incoming<'_>,
         applied: &mut Applied,
     ) {
+        let time = incoming.time;
         let (Some(&target), Some(&text)) = (params.first(), params.get(1)) else {
             return;
         };
+        let own = self.is_me(from);
+        if !own && self.ignored(source) {
+            return;
+        }
         let target = self.isupport.strip_statusmsg(target);
         let mut kind = if notice {
             LineKind::Notice
@@ -619,7 +1391,25 @@ impl NetworkState {
             kind = LineKind::Action;
             text = args;
         }
-        let own = self.is_me(from);
+        // IRCv3 echo-message: your own line coming back confirms the one
+        // waiting, found by label, else by target and text. One that
+        // matches nothing was sent elsewhere (another client on a bouncer).
+        if own && self.has("echo-message") {
+            let target_key = self.fold(target);
+            let position = match incoming.label {
+                Some(label) => self
+                    .pending
+                    .iter()
+                    .position(|pending| pending.label.as_deref() == Some(label)),
+                None => self.pending.iter().position(|pending| {
+                    pending.target == target_key && pending.kind == kind && pending.text == text
+                }),
+            };
+            if let Some(pending) = position.and_then(|at| self.pending.remove(at)) {
+                self.confirm(pending, text, applied);
+                return;
+            }
+        }
         let channel = self.isupport.is_channel(target);
         // A server's notices, and notices before registration, have no nick!user@host source.
         let from_server = from.is_empty() || (!source.contains('!') && from.contains('.'));
@@ -638,9 +1428,33 @@ impl NetworkState {
         };
         applied.list |= opened;
         if channel {
-            self.buffers[index]
-                .members
-                .touch(from, time, &self.isupport);
+            let buffer = &mut self.buffers[index];
+            let mut shown_join = None;
+            if let Some(member) = buffer.members.get_mut(from, &self.isupport) {
+                member.spoke = time;
+                if let Some(account) = &incoming.account {
+                    member.account = Some(account.clone());
+                }
+                // Speaking soon after joining shows the join the smart
+                // filter hid.
+                if let Some((line, joined)) = member.join_line.take()
+                    && time.saturating_sub(joined) < QUIET_MS
+                {
+                    shown_join = Some(line);
+                }
+            }
+            if let Some(id) = shown_join
+                && let Some(line) = buffer.line_mut(id)
+            {
+                line.quiet = false;
+            }
+        } else if index > 0
+            && !own
+            && let Some(account) = incoming.account
+        {
+            // IRCv3 account-tag: who is writing to you.
+            self.buffers[index].peer.account = Some(account);
+            applied.detail(index);
         }
         let mut line = Line::message(time, kind, from, text);
         line.own = own;
@@ -761,6 +1575,301 @@ mod tests {
             .iter()
             .map(|line| line.text.clone())
             .collect()
+    }
+
+    /// A network with these capabilities enabled, in #rust with alice
+    /// and bob.
+    fn with_caps(caps: &[&str]) -> (NetworkState, usize) {
+        let mut network = network();
+        network.caps = caps.iter().map(|cap| cap.to_string()).collect();
+        apply(&mut network, ":ruby!u@h JOIN #rust");
+        apply(&mut network, ":srv 353 ruby = #rust :ruby alice bob");
+        apply(&mut network, ":srv 366 ruby #rust :End of /NAMES list.");
+        let index = network.find("#rust").unwrap();
+        (network, index)
+    }
+
+    #[test]
+    fn netsplits_and_netjoins_collapse_into_one_line() {
+        let (mut network, rust) = with_caps(&["batch"]);
+        apply(&mut network, ":srv BATCH +sp netsplit irc.hub other.host");
+        let held = apply(
+            &mut network,
+            "@batch=sp :alice!a@h QUIT :irc.hub other.host",
+        );
+        assert!(held.buffers.is_empty(), "held until the batch ends");
+        apply(&mut network, "@batch=sp :bob!b@h QUIT :irc.hub other.host");
+        let applied = apply(&mut network, ":srv BATCH -sp");
+        assert!(applied.buffers.contains(&rust));
+        assert_eq!(
+            texts(&network, rust).last().unwrap(),
+            "Netsplit irc.hub ↔ other.host: alice, bob"
+        );
+        assert!(
+            !network.buffers[rust]
+                .members
+                .contains("alice", &network.isupport)
+        );
+        apply(&mut network, ":srv BATCH +j netjoin irc.hub other.host");
+        apply(&mut network, "@batch=j :alice!a@h JOIN #rust");
+        apply(&mut network, ":srv BATCH -j");
+        assert_eq!(
+            texts(&network, rust).last().unwrap(),
+            "Netjoin irc.hub ↔ other.host: alice"
+        );
+        assert!(
+            network.buffers[rust]
+                .members
+                .contains("alice", &network.isupport)
+        );
+        // Unknown types and nested batches apply their messages in order.
+        apply(&mut network, ":srv BATCH +outer example.com/foo");
+        apply(
+            &mut network,
+            "@batch=outer :srv BATCH +inner example.com/bar",
+        );
+        apply(&mut network, "@batch=inner :alice!a@h PRIVMSG #rust :inner");
+        apply(&mut network, "@batch=outer :alice!a@h PRIVMSG #rust :outer");
+        apply(&mut network, "@batch=outer :srv BATCH -inner");
+        assert_eq!(
+            texts(&network, rust).last().unwrap(),
+            "Netjoin irc.hub ↔ other.host: alice"
+        );
+        apply(&mut network, ":srv BATCH -outer");
+        let last: Vec<String> = texts(&network, rust).into_iter().rev().take(2).collect();
+        assert_eq!(last, ["inner", "outer"]);
+    }
+
+    #[test]
+    fn echoes_confirm_waiting_lines_and_refusals_fail_them() {
+        let (mut network, rust) = with_caps(&["echo-message", "labeled-response", "batch"]);
+        let label = network.label(rust).unwrap();
+        network.echo(rust, LineKind::Message, "hello", 500, Some(label.clone()));
+        let line = network.buffers[rust].lines().back().unwrap();
+        assert!(line.pending && line.own);
+        // The server may change the text; the echo carries the label.
+        apply(
+            &mut network,
+            &format!("@label={label} :ruby!u@h PRIVMSG #rust :hello!"),
+        );
+        let lines = network.buffers[rust].lines();
+        assert_eq!(lines.back().unwrap().text, "hello!");
+        assert!(!lines.back().unwrap().pending);
+        assert_eq!(
+            lines.iter().filter(|line| line.own).count(),
+            1,
+            "the echo is not a second line"
+        );
+        // Without labels: matched by target and text.
+        network.caps = vec![String::from("echo-message")];
+        network.echo(rust, LineKind::Action, "waves", 600, None);
+        apply(
+            &mut network,
+            ":ruby!u@h PRIVMSG #rust :\u{1}ACTION waves\u{1}",
+        );
+        assert!(!network.buffers[rust].lines().back().unwrap().pending);
+        // Refused: 404 to that channel.
+        network.echo(rust, LineKind::Message, "shh", 700, None);
+        apply(&mut network, ":srv 404 ruby #rust :Cannot send to channel");
+        let refused = network.buffers[rust]
+            .lines()
+            .iter()
+            .find(|line| line.text == "shh")
+            .unwrap();
+        assert!(refused.failed && !refused.pending);
+        // Lost with the connection.
+        network.echo(rust, LineKind::Message, "bye", 800, None);
+        network.disconnected();
+        assert!(
+            network.buffers[rust]
+                .lines()
+                .iter()
+                .any(|line| line.text == "bye" && line.failed)
+        );
+        // An echo of a line sent elsewhere (another client) is a new line.
+        network.caps = vec![String::from("echo-message")];
+        apply(&mut network, ":ruby!u@h PRIVMSG #rust :from my phone");
+        assert_eq!(texts(&network, rust).last().unwrap(), "from my phone");
+    }
+
+    #[test]
+    fn labeled_replies_go_to_the_buffer_that_asked() {
+        let (mut network, rust) = with_caps(&["labeled-response", "batch"]);
+        let label = network.label(rust).unwrap();
+        apply(
+            &mut network,
+            &format!("@label={label} :srv BATCH +w labeled-response"),
+        );
+        apply(&mut network, "@batch=w :srv 311 ruby alice a host * :Alice");
+        apply(
+            &mut network,
+            "@batch=w :srv 318 ruby alice :End of /WHOIS list.",
+        );
+        apply(&mut network, ":srv BATCH -w");
+        let text = texts(&network, rust);
+        assert!(
+            text.iter().any(|line| line == "alice is a@host (Alice)"),
+            "{text:?}"
+        );
+        // A labeled ACK says nothing; a labeled FAIL shows where it was asked.
+        let ack = network.label(rust).unwrap();
+        let before = network.buffers[rust].lines().len();
+        apply(&mut network, &format!("@label={ack} :srv ACK"));
+        assert_eq!(network.buffers[rust].lines().len(), before);
+        let fail = network.label(rust).unwrap();
+        apply(
+            &mut network,
+            &format!("@label={fail} :srv FAIL CHATHISTORY INVALID_TARGET :No such target"),
+        );
+        let last = network.buffers[rust].lines().back().unwrap().clone();
+        assert_eq!(
+            (last.kind, last.text.as_str()),
+            (LineKind::Error, "No such target (CHATHISTORY)")
+        );
+        // Unlabeled notes go to the server buffer.
+        apply(&mut network, ":srv NOTE * OPER_MESSAGE :Be nice");
+        assert_eq!(texts(&network, 0).last().unwrap(), "Be nice");
+        // No labels without the capability.
+        network.caps.clear();
+        assert!(network.label(rust).is_none());
+    }
+
+    #[test]
+    fn away_account_and_names_follow_the_capabilities() {
+        let mut network = network();
+        network.caps = [
+            "away-notify",
+            "account-notify",
+            "extended-join",
+            "account-tag",
+        ]
+        .iter()
+        .map(|cap| cap.to_string())
+        .collect();
+        // WHO after joining: WHOX when the server has it, answered quietly.
+        apply(&mut network, ":srv 005 ruby WHOX :are supported");
+        apply(&mut network, ":ruby!u@h JOIN #rust");
+        apply(&mut network, ":srv 353 ruby = #rust :ruby alice bob");
+        let applied = apply(&mut network, ":srv 366 ruby #rust :End of /NAMES list.");
+        assert_eq!(applied.replies, ["WHO #rust %tcnfa,152"]);
+        let rust = network.find("#rust").unwrap();
+        apply(&mut network, ":ruby!u@h JOIN #other");
+        let applied = apply(&mut network, ":srv 366 ruby #other :End of /NAMES list.");
+        assert!(applied.replies.is_empty(), "one WHO at a time");
+        let before = texts(&network, 0).len();
+        apply(&mut network, ":srv 354 ruby 152 #rust alice G alicea");
+        apply(&mut network, ":srv 354 ruby 152 #rust bob H 0");
+        let applied = apply(&mut network, ":srv 315 ruby #rust :End of WHO list.");
+        assert_eq!(applied.replies, ["WHO #other %tcnfa,152"], "then the next");
+        assert_eq!(texts(&network, 0).len(), before, "nothing shown");
+        let alice = network.buffers[rust]
+            .members
+            .get("alice", &network.isupport)
+            .unwrap();
+        assert!(alice.away);
+        assert_eq!(alice.account.as_deref(), Some("alicea"));
+        apply(&mut network, ":alice!a@h AWAY");
+        apply(&mut network, ":bob!b@h ACCOUNT bobb");
+        let members = &network.buffers[rust].members;
+        assert!(!members.get("alice", &network.isupport).unwrap().away);
+        assert_eq!(
+            members
+                .get("bob", &network.isupport)
+                .unwrap()
+                .account
+                .as_deref(),
+            Some("bobb")
+        );
+        apply(&mut network, ":carol!c@h JOIN #rust carolc :Carol C");
+        let carol = network.buffers[rust]
+            .members
+            .get("carol", &network.isupport)
+            .unwrap();
+        assert_eq!(carol.account.as_deref(), Some("carolc"));
+        // A query learns from account-tag, AWAY and SETNAME.
+        apply(&mut network, "@account=dd :dave!d@h PRIVMSG ruby :hi");
+        let dave = network.find("dave").unwrap();
+        apply(&mut network, ":dave!d@h AWAY :lunch");
+        apply(&mut network, ":dave!d@h SETNAME :Dave D");
+        let peer = &network.buffers[dave].peer;
+        assert_eq!(peer.account.as_deref(), Some("dd"));
+        assert_eq!(peer.away.as_deref(), Some("lunch"));
+        assert_eq!(peer.realname.as_deref(), Some("Dave D"));
+        // CHGHOST changes nothing shown.
+        let before = texts(&network, 0).len();
+        apply(&mut network, ":alice!a@h CHGHOST b ckyard");
+        assert_eq!(texts(&network, 0).len(), before);
+        // invite-notify: someone else invited, in the channel.
+        apply(&mut network, ":alice!a@h INVITE erin #rust");
+        assert_eq!(
+            texts(&network, rust).last().unwrap(),
+            "alice invited erin to #rust"
+        );
+    }
+
+    #[test]
+    fn monitor_watches_open_queries() {
+        let mut network = network();
+        apply(&mut network, ":srv 005 ruby MONITOR=100 :are supported");
+        assert!(network.monitor_lines().is_empty());
+        apply(&mut network, ":alice!a@h PRIVMSG ruby :hi");
+        apply(&mut network, ":bob!b@h PRIVMSG ruby :hi");
+        assert_eq!(network.monitor_lines(), ["MONITOR + alice,bob"]);
+        assert!(network.monitor_lines().is_empty(), "already watched");
+        let bob = network.find("bob").unwrap();
+        network.close(bob);
+        assert_eq!(network.monitor_lines(), ["MONITOR - bob"]);
+        let applied = apply(&mut network, ":srv 731 ruby :alice");
+        let alice = network.find("alice").unwrap();
+        assert_eq!(network.buffers[alice].peer.online, Some(false));
+        assert!(applied.list);
+        apply(&mut network, ":srv 730 ruby :alice!a@h");
+        assert_eq!(network.buffers[alice].peer.online, Some(true));
+    }
+
+    #[test]
+    fn the_smart_filter_marks_quiet_comings_and_goings() {
+        let (mut network, rust) = with_caps(&[]);
+        let at = |network: &mut NetworkState, line: &str, now: i64| {
+            network.apply(&Message::parse(line).unwrap(), now);
+        };
+        at(&mut network, ":carol!c@h JOIN #rust", 10_000);
+        assert!(network.buffers[rust].lines().back().unwrap().quiet);
+        let join = network.buffers[rust].lines().back().unwrap().id;
+        // Speaking soon after shows the join.
+        at(&mut network, ":carol!c@h PRIVMSG #rust :hi all", 20_000);
+        let lines = network.buffers[rust].lines();
+        assert!(!lines[network.buffers[rust].index_of(join).unwrap()].quiet);
+        // Leaving soon after speaking shows; someone silent leaves quietly.
+        at(&mut network, ":carol!c@h PART #rust", 30_000);
+        assert!(!network.buffers[rust].lines().back().unwrap().quiet);
+        at(&mut network, ":alice!a@h QUIT :bye", 40_000);
+        assert!(network.buffers[rust].lines().back().unwrap().quiet);
+        // A kick always shows.
+        at(&mut network, ":op!o@h KICK #rust bob :out", 50_000);
+        assert!(!network.buffers[rust].lines().back().unwrap().quiet);
+    }
+
+    #[test]
+    fn ignored_people_say_nothing() {
+        let (mut network, rust) = with_caps(&[]);
+        let mask = network.ignore_mask("Alice");
+        assert_eq!(mask, "alice!*@*");
+        network.ignores.push(mask);
+        network
+            .ignores
+            .push(network.ignore_mask("*!*@spam.example"));
+        let before = texts(&network, rust).len();
+        apply(&mut network, ":ALICE!a@h PRIVMSG #rust :hello");
+        apply(&mut network, ":mallory!m@spam.example PRIVMSG #rust :buy");
+        apply(&mut network, ":mallory!m@spam.example PRIVMSG ruby :buy");
+        assert_eq!(texts(&network, rust).len(), before);
+        assert!(network.find("mallory").is_none(), "no query opened");
+        apply(&mut network, ":bob!b@h PRIVMSG #rust :still here");
+        assert_eq!(texts(&network, rust).len(), before + 1);
+        assert!(glob("a*c?e", "abcde"));
+        assert!(!glob("a*c?e", "abcd"));
+        assert!(glob("*", ""));
     }
 
     #[test]

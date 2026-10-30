@@ -28,6 +28,9 @@ pub struct SessionNetwork {
     pub buffers: Vec<SessionBuffer>,
     /// The buffer shown; empty for the server buffer.
     pub shown: String,
+    /// Ignore masks, for an address from quick connect (saved networks
+    /// keep theirs in `networks.toml`).
+    pub ignores: Vec<String>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -74,6 +77,16 @@ impl Session {
                     nick: table.string("nick").unwrap_or("").to_string(),
                     buffers,
                     shown: table.string("shown").unwrap_or("").to_string(),
+                    ignores: match table.get("ignore") {
+                        Some(Value::Array(items)) => items
+                            .iter()
+                            .filter_map(|item| match item {
+                                Value::String(mask) => Some(mask.clone()),
+                                _ => None,
+                            })
+                            .collect(),
+                        _ => Vec::new(),
+                    },
                 })
             })
             .collect::<Vec<_>>();
@@ -105,6 +118,12 @@ impl Session {
                 table.insert("tls", Value::Boolean(network.tls));
                 table.insert("nick", Value::String(network.nick.clone()));
                 table.insert("shown", Value::String(network.shown.clone()));
+                if !network.ignores.is_empty() {
+                    table.insert(
+                        "ignore",
+                        Value::Array(network.ignores.iter().cloned().map(Value::String).collect()),
+                    );
+                }
                 let buffers = network
                     .buffers
                     .iter()
@@ -156,6 +175,7 @@ mod tests {
                         },
                     ],
                     shown: String::from("#rust"),
+                    ignores: vec![String::from("spam!*@*")],
                 },
                 SessionNetwork {
                     host: String::from("irc.example.net"),

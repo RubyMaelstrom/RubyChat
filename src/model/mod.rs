@@ -46,6 +46,15 @@ pub struct Line {
     pub highlight: bool,
     /// You sent it.
     pub own: bool,
+    /// Sent, and waiting for the server's echo to confirm it
+    /// (`echo-message`).
+    pub pending: bool,
+    /// The server refused it, or the connection ended before it was
+    /// confirmed.
+    pub failed: bool,
+    /// A join, part, quit or nick change of someone who hadn't spoken
+    /// lately, which the smart filter hides.
+    pub quiet: bool,
     /// Its buffer's serial number for it (0 until added to a buffer).
     pub id: u64,
 }
@@ -65,6 +74,9 @@ impl Line {
             text: text.into(),
             highlight: false,
             own: false,
+            pending: false,
+            failed: false,
+            quiet: false,
             id: 0,
         }
     }

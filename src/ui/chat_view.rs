@@ -38,6 +38,9 @@ const LABEL_MIN: usize = 5;
 const LABEL_MAX: usize = 14;
 /// A labeled rule: NEW MESSAGES, or a new day.
 const RULE_HEIGHT: f32 = 26.0;
+/// How far back a line looks past hidden lines for the day of the last
+/// line shown.
+const FILTER_LOOKBACK: usize = 256;
 /// Selected text's background.
 pub const SELECTION: Color = Color::rgba(0x6e, 0x4e, 0x9e, 150);
 
@@ -69,6 +72,15 @@ pub struct ChatContext<'a> {
     /// Where the NEW MESSAGES rule goes.
     pub marker: Option<u64>,
     pub label_chars: usize,
+    /// The smart filter hides quiet lines.
+    pub filter: bool,
+}
+
+impl ChatContext<'_> {
+    /// Whether line `line` takes no room.
+    fn hidden(&self, line: &Line) -> bool {
+        self.filter && line.quiet
+    }
 }
 
 /// Where the columns go in a view.
@@ -125,8 +137,15 @@ impl Block {
     }
 }
 
-/// Label and text colors for each kind of line.
+/// Label and text colors for each kind of line. A message still waiting
+/// for the server's echo is dimmed, and one the server refused is pink.
 fn colors(line: &Line, casemap: Casemap) -> (Color, Color) {
+    if line.failed {
+        return (PINK, PINK);
+    }
+    if line.pending {
+        return (DISABLED, MUTED);
+    }
     match line.kind {
         LineKind::Message if line.own => (MUTED, TEXT),
         LineKind::Message if !line.nick.is_empty() => (nick_color(&casemap.fold(&line.nick)), TEXT),
@@ -218,7 +237,23 @@ fn layout_block(
     index: usize,
 ) -> Block {
     let line = &lines[index];
-    let new_day = index > 0 && !same_day(lines[index - 1].time, line.time);
+    if context.hidden(line) {
+        return Block {
+            rule: None,
+            paragraph: Paragraph::default(),
+            links: Vec::new(),
+            plain: String::new(),
+            height: 0.0,
+        };
+    }
+    // A new day starts after the last line shown, hidden lines aside.
+    let previous = (0..index)
+        .rev()
+        .take(FILTER_LOOKBACK)
+        .find(|&earlier| !context.hidden(&lines[earlier]));
+    let new_day = previous
+        .or(index.checked_sub(1))
+        .is_some_and(|earlier| !same_day(lines[earlier].time, line.time));
     let rule = match (context.marker == Some(line.id), new_day) {
         (true, true) => Some((format!("NEW MESSAGES · {}", day_label(line.time)), true)),
         (true, false) => Some((String::from("NEW MESSAGES"), true)),
@@ -433,6 +468,7 @@ pub struct ChatFrame {
     marker: Option<u64>,
     chantypes: String,
     casemap: Casemap,
+    filter: bool,
 }
 
 impl ChatFrame {
@@ -580,6 +616,7 @@ pub fn paint_chat(
     let columns = Columns::new(painter.text, rect, view.context.label_chars);
     let reusable = previous.columns == Some(columns)
         && previous.rect == rect
+        && previous.filter == view.context.filter
         && previous.marker == view.context.marker
         && previous.chantypes == view.context.chantypes
         && previous.casemap == view.context.casemap;
@@ -591,6 +628,7 @@ pub fn paint_chat(
         marker: view.context.marker,
         chantypes: view.context.chantypes.to_string(),
         casemap: view.context.casemap,
+        filter: view.context.filter,
     };
     let old_tops: Vec<(u64, f32)> = previous
         .shown
@@ -714,6 +752,10 @@ pub fn paint_chat(
     }
     let style = chat_style();
     for (index, block, top) in blocks {
+        // A hidden line takes no room and shows nothing.
+        if block.height == 0.0 {
+            continue;
+        }
         let line = &lines[index];
         let rows_top = top + block.rule_height();
         let rows_height = block.height - block.rule_height();
@@ -880,7 +922,14 @@ fn paint_url(painter: &mut Painter<'_>, rect: Rect, url: &str) {
 
 /// The selected text for the clipboard. Within one line, just the text;
 /// across lines, each as `[HH:MM] <nick> text`.
-pub fn selected_text(lines: &VecDeque<Line>, start: TextPosition, end: TextPosition) -> String {
+/// The selection's text: part of one line, or whole lines as a log reads.
+/// Lines the smart filter hides (`filter`) are left out, as on screen.
+pub fn selected_text(
+    lines: &VecDeque<Line>,
+    start: TextPosition,
+    end: TextPosition,
+    filter: bool,
+) -> String {
     let plain = |line: &Line| -> String {
         let text = format::strip(&line.text).into_owned();
         if line.kind == LineKind::Action {
@@ -909,7 +958,7 @@ pub fn selected_text(lines: &VecDeque<Line>, start: TextPosition, end: TextPosit
     let mut out = String::new();
     for line in lines
         .iter()
-        .filter(|line| (start.id..=end.id).contains(&line.id))
+        .filter(|line| (start.id..=end.id).contains(&line.id) && !(filter && line.quiet))
     {
         let text = plain(line);
         let from = if line.id == start.id {
@@ -954,6 +1003,7 @@ mod tests {
             chantypes: "#",
             marker: None,
             label_chars: 6,
+            filter: true,
         }
     }
 
@@ -987,6 +1037,55 @@ mod tests {
             ChatFrame::default(),
             false,
         )
+    }
+
+    #[test]
+    fn the_smart_filter_hides_quiet_lines_but_keeps_day_rules() {
+        const DAY: i64 = 86_400_000;
+        let mut lines = lines(6);
+        for line in &mut lines {
+            line.time = 10 * DAY;
+        }
+        // A quiet join starts the next day; the line after it still gets
+        // that day's rule.
+        lines[3].kind = LineKind::Event;
+        lines[3].quiet = true;
+        lines[3].time = 11 * DAY;
+        lines[4].time = 11 * DAY;
+        lines[5].time = 11 * DAY;
+        let frame = paint(&lines, None);
+        let ids: Vec<u64> = frame.shown.iter().map(|line| line.id).collect();
+        assert_eq!(ids, [6, 5, 3, 2, 1], "the quiet line is skipped");
+        let fifth = frame.shown.iter().find(|line| line.id == 5).unwrap();
+        assert!(
+            fifth.rule.is_some(),
+            "the day's rule moves to the next line shown"
+        );
+        // Without the filter everything shows, the rule on the quiet line.
+        let mut canvas = Canvas::new(500, 200);
+        let mut text = TextSystem::new();
+        let mut painter = Painter::new(&mut canvas, &mut text, 1.0);
+        let view = ChatView {
+            lines: &lines,
+            context: ChatContext {
+                filter: false,
+                ..context()
+            },
+            anchor: None,
+            selection: None,
+            hovered: None,
+            focused: true,
+        };
+        let all = paint_chat(
+            &mut painter,
+            Rect::new(0.0, 0.0, 500.0, 200.0),
+            &view,
+            ChatFrame::default(),
+            false,
+        );
+        assert_eq!(all.shown.len(), 6);
+        let quiet = all.shown.iter().find(|line| line.id == 4).unwrap();
+        assert!(quiet.rule.is_some());
     }
 
     #[test]
@@ -1317,8 +1416,8 @@ mod tests {
             lines.push_back(line);
         }
         let at = |id, offset| TextPosition { id, offset };
-        assert_eq!(selected_text(&lines, at(1, 6), at(1, 11)), "there");
-        let both = selected_text(&lines, at(1, 0), at(2, 9));
+        assert_eq!(selected_text(&lines, at(1, 6), at(1, 11), true), "there");
+        let both = selected_text(&lines, at(1, 0), at(2, 9), true);
         let stamp = {
             let local = time::local(0);
             format!("[{:02}:{:02}]", local.hour, local.minute)

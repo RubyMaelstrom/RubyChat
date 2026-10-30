@@ -13,8 +13,15 @@ pub struct Member {
     /// Membership prefixes, highest rank first (`@+`).
     pub prefixes: String,
     pub away: bool,
-    /// When they last spoke, for completing recent speakers first.
+    /// When they last spoke, for completing recent speakers first and for
+    /// the smart filter.
     pub spoke: i64,
+    /// Their services account, when known (IRCv3 account-notify,
+    /// extended-join, account-tag, WHOX).
+    pub account: Option<String>,
+    /// Their join's line while the smart filter hides it, and when they
+    /// joined: speaking soon after shows it.
+    pub join_line: Option<(u64, i64)>,
 }
 
 impl Member {
@@ -24,6 +31,8 @@ impl Member {
             prefixes: prefixes.into(),
             away: false,
             spoke: 0,
+            account: None,
+            join_line: None,
         }
     }
 
@@ -114,6 +123,10 @@ impl Members {
         if let Some(member) = self.by_key.get_mut(&isupport.casemap.fold(nick)) {
             member.spoke = time;
         }
+    }
+
+    pub fn get_mut(&mut self, nick: &str, isupport: &Isupport) -> Option<&mut Member> {
+        self.by_key.get_mut(&isupport.casemap.fold(nick))
     }
 
     pub fn set_away(&mut self, nick: &str, away: bool, isupport: &Isupport) -> bool {

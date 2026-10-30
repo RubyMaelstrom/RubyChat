@@ -229,6 +229,8 @@ pub struct SavedNetwork {
     pub ctcp_replies: bool,
     pub quit_message: String,
     pub part_message: String,
+    /// Ignore masks (`nick!user@host` with `*` and `?`).
+    pub ignores: Vec<String>,
 }
 
 impl Default for SavedNetwork {
@@ -250,6 +252,7 @@ impl Default for SavedNetwork {
             ctcp_replies: true,
             quit_message: String::new(),
             part_message: String::new(),
+            ignores: Vec::new(),
         }
     }
 }
@@ -355,6 +358,7 @@ impl Networks {
                 ctcp_replies: table.boolean("ctcp_replies").unwrap_or(true),
                 quit_message: table.string("quit_message").unwrap_or("").to_string(),
                 part_message: table.string("part_message").unwrap_or("").to_string(),
+                ignores: strings(table, "ignore", &name)?,
                 ..SavedNetwork::default()
             };
             for server in table.tables("server") {
@@ -472,6 +476,9 @@ impl Networks {
                 table.insert("ctcp_replies", Value::Boolean(network.ctcp_replies));
                 table.insert("quit_message", Value::String(network.quit_message.clone()));
                 table.insert("part_message", Value::String(network.part_message.clone()));
+                if !network.ignores.is_empty() {
+                    table.insert("ignore", string_list(&network.ignores));
+                }
                 let servers = network
                     .servers
                     .iter()

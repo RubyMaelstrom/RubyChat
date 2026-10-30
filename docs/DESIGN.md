@@ -1,6 +1,6 @@
 # RubyChat design
 
-Draft 2 · 30 October 2026 · decisions settled (§17); milestones M0 to M4
+Draft 2 · 31 October 2026 · decisions settled (§17); milestones M0 to M5
 are implemented (§16).
 
 RubyChat is a desktop IRC client written in Rust. Its overriding goal is that
@@ -199,6 +199,12 @@ connecting heartbeat needs a strip to beat in.
 - STS: a plaintext connection that advertises `sts` is upgraded to TLS on the
   advertised port; the policy and its expiry are saved and enforced on later
   connections.
+- As built (IRCv3 STS): the link closes an insecure connection that offers
+  `sts=port=`, and the UI reconnects securely with that port's pins, a
+  "none" policy raised to "verify". A secure connection's `duration` is kept
+  in `sts.toml` and rescheduled whenever a connection closes; `duration=0`
+  removes it. While a policy holds, addresses for that host connect over
+  TLS on its port, with a line in the server buffer saying so.
 - The X25519MLKEM768 hybrid key exchange is preferred, as in TRust.
 
 ### 6.3 Wire format
@@ -226,7 +232,8 @@ Requested when offered: `account-notify`, `account-tag`, `away-notify`,
 `invite-notify`, `labeled-response`, `message-tags`, `multi-prefix`, `sasl`,
 `server-time`, `setname`, `standard-replies`, `sts`, `userhost-in-names`; from
 M6, `draft/chathistory`, `draft/event-playback`, `draft/read-marker` and
-`draft/multiline`.
+`draft/multiline`. As built, `sts` is read but never requested, as its
+specification requires; the link tells the UI which capabilities are on.
 
 ISUPPORT tokens used: `CASEMAPPING`, `CHANMODES`, `CHANTYPES`, `PREFIX`,
 `STATUSMSG`, `TARGMAX`, `NICKLEN`, `TOPICLEN`, `NETWORK`, `MONITOR`, `WHOX`,
@@ -284,6 +291,35 @@ how many lines are still queued.
 - Commands: `/join /part /msg /query /me /notice /nick /topic /mode /kick /ban
   /invite /whois /who /away /quote /list /ignore /close /clear /connect
   /disconnect /reconnect /server /ctcp /search`, plus user aliases.
+
+As built in M5:
+
+- Batches (IRCv3 batch) are held until they end, nested ones inside their
+  parent; `netsplit` and `netjoin` become one line per buffer naming up to
+  eight people, other types apply in order. At most 32 batches of 20,000
+  messages are held; past that, messages apply as they come.
+- Every command typed carries a `label` while `labeled-response` is on, so
+  its replies (WHOIS, errors, `FAIL`) return to the buffer it was typed in;
+  a labeled `ACK` says nothing. Without labels, WHOIS still follows the
+  buffer that asked, and the rest goes to the server buffer.
+- With `echo-message`, your line shows at once, dimmed, until its echo
+  confirms it, found by label or else by target and text; the server's
+  version of the text replaces yours. A refusal (labeled, or 401 and 404
+  for its target) or a lost connection turns it pink. An echo matching
+  nothing waiting is a line sent from another client on the same account
+  (a bouncer) and shows as yours.
+- Away and account state comes from `away-notify`, `account-notify`,
+  `extended-join` and `account-tag`, and after joining from one WHO at a
+  time (WHOX `%tcnfa` when offered) for channels up to 1,000 members,
+  answered quietly. `CHGHOST` and `SETNAME` change state, not the view.
+- MONITOR watches the open queries' nicks, within the server's limit: a
+  query shows online or offline, dimmed in the sidebar when offline.
+  `invite-notify` shows invitations to others in the channel.
+- Standard replies show as errors (`FAIL`), warnings (`WARN`) or notes
+  (`NOTE`), where labeled, else in the server buffer.
+- `/ignore [nick|mask]` and `/unignore` drop messages, notices, CTCP and
+  invitations from masks per network (a bare nick means `nick!*@*`), kept
+  in `networks.toml` for saved networks and in the session for others.
 
 ## 7. Data model and memory
 
@@ -430,7 +466,10 @@ server buffer shows the server and network names.
   message with a hanging indent.
 - Joins, parts, quits, and nick, mode and topic changes are compact and
   muted. A smart filter hides joins, parts and quits from people who haven't
-  spoken recently.
+  spoken recently. As built: "recently" is 15 minutes; a join is hidden
+  until its person speaks within that time; kicks always show; `/filter`
+  toggles it (on by default) until settings land. Hidden lines take no
+  room, leave day rules in place and stay out of copied text.
 - Highlights get a 2 px pink left accent and a faint pink tint; notices an
   amber `-nick-`; actions `* nick` in italics; your own lines a muted nick.
 - The unread marker and day changes are labeled rules (`NEW MESSAGES`,
@@ -657,6 +696,8 @@ as they're measured.
 - Session restore: networks connected at exit, or set to connect at startup,
   reconnect with their channels and queries in their saved order. Each
   buffer's last lines load from its log the first time it's shown.
+- As built (M5): STS policies live in `sts.toml` (host, port, duration and
+  expiry), and ignore masks in each network's `ignore` list.
 - As built: the session keeps networks that are connected or reconnecting,
   with the channels they are in or joining, their queries, the buffer each
   shows and the network shown. It is saved as it changes, with queued saves
@@ -871,6 +912,11 @@ the primary selection (middle click) is not supported.
   a tray, notifications and their clicks, tray state, away, and links for
   an open network. Ignored live tests: `session_bus`, `live_tray` and
   `activates_a_surface`.
+- Since M5: batches (netsplit and netjoin collapsing, nesting, types
+  applied in order), echo confirmation by label and by text, refusals and
+  lost connections, labeled routing of WHOIS, `ACK` and `FAIL`, away and
+  account state through WHOX, MONITOR, the smart filter, ignores, STS in
+  the link and the app, and labeled sends from the input.
 - Before handoff: `cargo fmt --check`, `cargo clippy --all-targets`,
   `cargo test`, `cargo test --release`, `cargo build --release`.
 - By hand: Libera.Chat and OFTC over TLS; a local ergo for self-signed
@@ -945,6 +991,19 @@ Still 89 crates. Not yet: the Windows tray, notifications and named pipe
 (they come with the Windows build, M7), muting a buffer, showing the icon
 only while the window is closed, and installing the desktop file.
 
+M5's scope is implemented and tested, and checked on a local ergo 2.19.1
+(the official release, checksum-verified): a plaintext address upgraded to
+TLS by STS and later connected securely from the saved policy; SASL PLAIN;
+a message confirmed by its echo and one to an absent nick turned pink with
+the server's error beside it; WHOIS replies in the query that asked; a
+query's header showing online, account and away from MONITOR, WHOIS and
+away-notify; the smart filter hiding a silent part and showing a join once
+its person spoke. Through ergo's own bouncer (an always-on account with a
+second client attached), a line sent from the other client showed once, as
+yours. Not yet: a netsplit on a real network (ergo doesn't link servers;
+the scripted tests cover them), the raw protocol view, and per-buffer
+ignore lists.
+
 | | Scope | Done when |
 |---|---|---|
 | M0 | Window and renderer: skeleton; undecorated window with the ported strip; move, resize, maximize, minimize, close; canvas, damage and presentation; rasterizer; text in embedded JetBrains Mono; tracing; snapshots | The strip snapshot matches TRust's preview, and an idle window wakes nothing |
@@ -1014,6 +1073,19 @@ Settled while building M4:
     than connecting a second time; so do the first launch's own addresses.
 20. **The Windows tray waits for the Windows build** (M7), since nothing
     for Windows is built or tested yet; until then closing quits there.
+
+Settled while building M5:
+
+21. **Every typed command is labeled** while `labeled-response` is on, so
+    its replies come back to the buffer it was typed in.
+22. **A confirmed echo keeps its line's place and time**, taking the
+    server's text; one that matches nothing shows as sent from elsewhere.
+23. **The smart filter's window is 15 minutes**, joins stay hidden until
+    their person speaks, and kicks always show; `/filter` toggles it.
+24. **An STS upgrade always verifies the certificate** (pins still count),
+    and the UI, which owns the pins, makes the secure reconnection.
+25. **Ignores are per network**, and WHO after joining asks only about
+    channels up to 1,000 members, one at a time.
 
 ## 18. Standards
 

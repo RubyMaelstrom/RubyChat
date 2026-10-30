@@ -31,6 +31,18 @@ pub enum Activity {
     Highlight,
 }
 
+/// What a query knows about the person on the other end (DESIGN.md
+/// §8.5).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Peer {
+    /// Online or not, from MONITOR; `None` until the server says.
+    pub online: Option<bool>,
+    pub account: Option<String>,
+    /// Their away message, while away.
+    pub away: Option<String>,
+    pub realname: Option<String>,
+}
+
 /// Where a scrolled-up view rests: the bottom of line `id` is `below`
 /// pixels under the view's bottom edge. Anchoring to a line rather than a
 /// pixel offset keeps the view still as lines arrive and the width changes
@@ -76,6 +88,8 @@ pub struct Buffer {
     pub marker: Option<u64>,
     /// The longest nick column label among its lines, in characters.
     pub label_chars: usize,
+    /// A query's person.
+    pub peer: Peer,
 }
 
 impl Buffer {
@@ -106,6 +120,7 @@ impl Buffer {
             input: LineEditor::default(),
             marker: None,
             label_chars: 0,
+            peer: Peer::default(),
         }
     }
 
@@ -149,6 +164,12 @@ impl Buffer {
         let first = self.lines.front()?.id;
         let index = usize::try_from(id.checked_sub(first)?).ok()?;
         (index < self.lines.len()).then_some(index)
+    }
+
+    /// The line with serial number `id`, to change it in place.
+    pub fn line_mut(&mut self, id: u64) -> Option<&mut Line> {
+        let index = self.index_of(id)?;
+        self.lines.get_mut(index)
     }
 
     pub fn clear(&mut self) {

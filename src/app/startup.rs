@@ -26,6 +26,7 @@ pub(super) struct Startup {
     networks: Option<Option<String>>,
     secrets: Option<Option<String>>,
     known_hosts: bool,
+    sts: bool,
     pub(super) session: Option<Option<Session>>,
     /// Addresses from the command line, connected once started.
     pub(super) addresses: Vec<String>,
@@ -56,6 +57,7 @@ impl App {
                     Document::Networks,
                     Document::Secrets,
                     Document::KnownHosts,
+                    Document::Sts,
                     Document::Session,
                 ] {
                     store.load(document);
@@ -92,6 +94,15 @@ impl App {
                 }
                 self.startup.known_hosts = true;
             }
+            Document::Sts => {
+                if let Some(text) = text {
+                    match crate::config::sts::StsPolicies::parse(&text) {
+                        Ok(policies) => self.sts = policies,
+                        Err(error) => eprintln!("rubychat: {error}"),
+                    }
+                }
+                self.startup.sts = true;
+            }
             Document::Session => {
                 let session = text.and_then(|text| {
                     Session::parse(&text)
@@ -116,6 +127,7 @@ impl App {
             && startup.networks.is_some()
             && startup.secrets.is_some()
             && startup.known_hosts
+            && startup.sts
             && startup.session.is_some()
         {
             self.start();
@@ -230,12 +242,65 @@ impl App {
         config.reconnect = saved.reconnect;
         config.quit_message = saved.quit_message.clone();
         config.certificate = server.certificate;
+        self.apply_sts(&mut config);
         config.pins = self
             .known_hosts
-            .get(&server.host, server.port)
+            .get(&config.host, config.port)
             .into_iter()
             .collect();
         config
+    }
+
+    /// A host with an STS policy in force is reached over TLS on the
+    /// policy's port, verified (IRCv3 STS); true if that changed `config`.
+    pub(super) fn apply_sts(&self, config: &mut ConnectConfig) -> bool {
+        let now = crate::platform::time::now_ms() / 1000;
+        match self.sts.get(&config.host, now) {
+            Some(policy) if !config.tls => {
+                config.tls = true;
+                config.port = policy.port;
+                if config.certificate == crate::config::networks::CertificatePolicy::None {
+                    config.certificate = crate::config::networks::CertificatePolicy::Verify;
+                }
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// The server advertised an STS policy: an upgraded connection now
+    /// uses TLS, and a secure one's policy is kept (or removed) in
+    /// `sts.toml`.
+    pub(super) fn sts_advertised(&mut self, id: NetworkId, sts: crate::net::Sts) {
+        if sts.upgraded
+            && let Some(index) = self.index_of(id)
+        {
+            // Reconnect securely, with the pins for the new port.
+            let pins: Vec<_> = self
+                .known_hosts
+                .get(&sts.host, sts.port)
+                .into_iter()
+                .collect();
+            let network = &mut self.networks[index];
+            network.config.tls = true;
+            network.config.port = sts.port;
+            network.config.pins = pins;
+            if network.config.certificate == crate::config::networks::CertificatePolicy::None {
+                network.config.certificate = crate::config::networks::CertificatePolicy::Verify;
+            }
+            let config = network.config.clone();
+            self.send(NetCommand::Connect(id, config));
+            self.session_changed();
+            self.mark_sidebar();
+            self.mark_header();
+        }
+        if let Some(duration) = sts.duration {
+            let now = crate::platform::time::now_ms() / 1000;
+            self.sts.set(&sts.host, sts.port, duration, now);
+            if let Some(store) = &self.store {
+                store.save(Document::Sts, self.sts.to_toml(now));
+            }
+        }
     }
 
     /// Connects a saved network, opening its channels (and, restoring a
@@ -258,6 +323,7 @@ impl App {
         network.commands = saved.commands.clone();
         network.state.ctcp_replies = saved.ctcp_replies;
         network.state.part_message = saved.part_message.clone();
+        network.state.ignores = saved.ignores.clone();
         let buffers = restore
             .map(|entry| entry.buffers.as_slice())
             .unwrap_or_default();
@@ -283,9 +349,10 @@ impl App {
             .unwrap_or_else(commands::default_nick);
         let mut config = ConnectConfig::new(server.host.clone(), server.port, server.tls, nick);
         config.password = server.password;
+        let upgraded = self.apply_sts(&mut config);
         config.pins = self
             .known_hosts
-            .get(&server.host, server.port)
+            .get(&config.host, config.port)
             .into_iter()
             .collect();
         let title = server
@@ -312,6 +379,16 @@ impl App {
             .unwrap_or_default();
         let shown = restore.map(|entry| entry.shown.as_str());
         open_buffers(network, buffers, &autojoin, shown);
+        if let Some(entry) = restore {
+            network.state.ignores = entry.ignores.clone();
+        }
+        if upgraded {
+            let text = format!(
+                "{} asked to be reached over TLS only (STS): connecting securely to port {}",
+                config.host, config.port
+            );
+            network.push(0, LineKind::Status, "•", text);
+        }
         self.send(NetCommand::Connect(id, config));
         self.prompt_open = false;
         self.activate(index);
@@ -411,6 +488,11 @@ impl App {
                     String::new()
                 } else {
                     network.buffer().name.clone()
+                },
+                ignores: if network.saved.is_none() {
+                    network.state.ignores.clone()
+                } else {
+                    Vec::new()
                 },
             });
         }

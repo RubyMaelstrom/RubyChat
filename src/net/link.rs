@@ -36,13 +36,25 @@ const IDLE_PING: Duration = Duration::from_secs(90);
 /// How long that PING may go unanswered before the connection is dead.
 const PING_TIMEOUT: Duration = Duration::from_secs(60);
 const MAX_RECONNECT_DELAY: Duration = Duration::from_secs(300);
-/// Capabilities requested when offered; each arrives with the milestone
-/// that handles it (DESIGN.md §6.4).
+/// Capabilities requested when offered (DESIGN.md §6.4). `sts` is never
+/// requested, as its specification forbids.
 const WANTED_CAPS: &[&str] = &[
     "message-tags",
     "server-time",
     "multi-prefix",
     "userhost-in-names",
+    "account-notify",
+    "account-tag",
+    "away-notify",
+    "batch",
+    "cap-notify",
+    "chghost",
+    "echo-message",
+    "extended-join",
+    "invite-notify",
+    "labeled-response",
+    "setname",
+    "standard-replies",
 ];
 
 /// How a session logs in beyond the server password (DESIGN.md §6.5).
@@ -720,6 +732,29 @@ impl Link {
                     self.lost(ctx, Close::fatal(reason));
                     return;
                 }
+                Action::Caps(caps) => (ctx.sink)(NetEvent::Caps(self.id, caps)),
+                Action::StsUpgrade(port) => {
+                    // "It MUST close the insecure connection and reconnect
+                    // securely on the stated port", with verification: the
+                    // UI reconnects with settings for that port (its pins).
+                    self.config.tls = true;
+                    self.config.port = port;
+                    if self.config.certificate == CertificatePolicy::None {
+                        self.config.certificate = CertificatePolicy::Verify;
+                    }
+                    self.notice(
+                        ctx,
+                        format!(
+                            "The server requires TLS (STS): reconnecting securely to port {port}"
+                        ),
+                    );
+                    self.teardown(ctx);
+                    self.generation += 1;
+                    self.status(ctx, LinkStatus::Connecting);
+                    self.sts(ctx, None, true);
+                    return;
+                }
+                Action::StsDuration(duration) => self.sts(ctx, Some(duration), false),
             }
         }
     }
@@ -870,7 +905,22 @@ impl Link {
         );
     }
 
-    /// Closes whatever sockets the link holds; it becomes idle.
+    /// Tells the UI about an STS policy for this server.
+    fn sts(&self, ctx: &mut Ctx<'_>, duration: Option<u64>, upgraded: bool) {
+        (ctx.sink)(NetEvent::Sts(
+            self.id,
+            super::Sts {
+                host: self.config.host.clone(),
+                port: self.config.port,
+                duration,
+                upgraded,
+            },
+        ));
+    }
+
+    /// Closes whatever sockets the link holds; it becomes idle. A secure
+    /// connection's STS policy is rescheduled from now, as the
+    /// specification asks when connections close.
     fn teardown(&mut self, ctx: &mut Ctx<'_>) {
         match std::mem::replace(&mut self.state, State::Idle) {
             State::Connecting(mut connecting) => {
@@ -882,6 +932,9 @@ impl Link {
             State::Open(mut open) => {
                 let _ = ctx.registry.deregister(&mut open.stream);
                 ctx.tokens.free(open.token);
+                if let Some(duration) = open.session.sts_duration {
+                    self.sts(ctx, Some(duration), false);
+                }
             }
             State::Idle | State::Resolving | State::Waiting { .. } => {}
         }
@@ -911,6 +964,13 @@ enum Action {
     Notice(String),
     /// Close without reconnecting, for this reason.
     Fail(String),
+    /// The capabilities enabled now.
+    Caps(Vec<String>),
+    /// An insecure connection's STS upgrade policy: reconnect with TLS on
+    /// this port.
+    StsUpgrade(u16),
+    /// A secure connection's STS persistence policy, in seconds.
+    StsDuration(u64),
 }
 
 /// SASL's progress in a session.
@@ -942,6 +1002,11 @@ struct Session {
     logged_in: bool,
     ping: Option<(u64, Instant)>,
     ping_counter: u64,
+    /// The connection is TLS, so an STS persistence policy counts.
+    secure: bool,
+    /// The STS persistence policy advertised on this secure connection, in
+    /// seconds, for rescheduling its expiry when the connection closes.
+    sts_duration: Option<u64>,
 }
 
 impl Session {
@@ -968,6 +1033,8 @@ impl Session {
             logged_in: false,
             ping: None,
             ping_counter: 0,
+            secure: config.tls,
+            sts_duration: None,
         }
     }
 
@@ -1119,8 +1186,31 @@ impl Session {
         let subcommand = message.param(1).unwrap_or("").to_ascii_uppercase();
         let caps = message.last_param().unwrap_or("");
         let names = || caps.split(' ').filter(|cap| !cap.is_empty());
+        // IRCv3 STS: an insecure connection upgrades at once; a secure one
+        // keeps the persistence policy.
+        if matches!(subcommand.as_str(), "LS" | "NEW")
+            && let Some(policy) = names().find_map(|cap| cap.strip_prefix("sts="))
+        {
+            let (port, duration) = sts_policy(policy);
+            match (self.secure, port, duration) {
+                (false, Some(port), _) => return vec![Action::StsUpgrade(port)],
+                (true, _, Some(duration)) => {
+                    self.sts_duration = Some(duration);
+                    let mut actions = vec![Action::StsDuration(duration)];
+                    actions.extend(self.cap_after_sts(message, &subcommand));
+                    return actions;
+                }
+                _ => {}
+            }
+        }
+        self.cap_after_sts(message, &subcommand)
+    }
+
+    fn cap_after_sts(&mut self, message: &Message, subcommand: &str) -> Vec<Action> {
+        let caps = message.last_param().unwrap_or("");
+        let names = || caps.split(' ').filter(|cap| !cap.is_empty());
         // `sasl=PLAIN,EXTERNAL` lists the mechanisms (IRCv3 SASL 3.2).
-        if matches!(subcommand.as_str(), "LS" | "NEW") {
+        if matches!(subcommand, "LS" | "NEW") {
             for cap in names().filter(|cap| cap_name(cap) == "sasl") {
                 let mechanisms = cap.split_once('=').map(|(_, list)| {
                     list.split(',')
@@ -1131,7 +1221,7 @@ impl Session {
                 self.sasl_offer = Some(mechanisms.unwrap_or_default());
             }
         }
-        match subcommand.as_str() {
+        match subcommand {
             "LS" => {
                 self.offered
                     .extend(names().map(|cap| cap_name(cap).to_string()));
@@ -1153,10 +1243,13 @@ impl Session {
                         None => self.enabled.push(cap.to_string()),
                     }
                 }
+                let mut actions = vec![Action::Caps(self.enabled.clone())];
                 if names().any(|cap| cap == "sasl") && matches!(self.sasl, Sasl::Ready) {
-                    return self.start_sasl();
+                    actions.extend(self.start_sasl());
+                } else {
+                    actions.extend(self.end());
                 }
-                self.end()
+                actions
             }
             "NAK" if names().any(|cap| cap == "sasl") && matches!(self.sasl, Sasl::Ready) => {
                 self.sasl_failed(String::from("the server refused the sasl capability"))
@@ -1166,7 +1259,7 @@ impl Session {
                 for cap in names() {
                     self.enabled.retain(|enabled| enabled != cap_name(cap));
                 }
-                Vec::new()
+                vec![Action::Caps(self.enabled.clone())]
             }
             _ => Vec::new(),
         }
@@ -1267,6 +1360,20 @@ impl Session {
             vec![Action::Send(String::from("CAP END"))]
         }
     }
+}
+
+/// An STS policy's port and duration (IRCv3 STS, "Details"); unknown keys
+/// and malformed values are ignored.
+fn sts_policy(value: &str) -> (Option<u16>, Option<u64>) {
+    let (mut port, mut duration) = (None, None);
+    for token in value.split(',') {
+        match token.split_once('=') {
+            Some(("port", value)) => port = value.parse().ok(),
+            Some(("duration", value)) => duration = value.parse().ok(),
+            _ => {}
+        }
+    }
+    (port, duration)
 }
 
 /// A capability's name without its `=value` (IRCv3 CAP LS 302 values).
@@ -1608,14 +1715,22 @@ mod tests {
                 "CAP REQ :message-tags server-time multi-prefix"
             ))]
         );
+        let enabled = vec![
+            String::from("message-tags"),
+            String::from("server-time"),
+            String::from("multi-prefix"),
+        ];
         assert_eq!(
             handle(
                 &mut s,
                 ":srv CAP * ACK :message-tags server-time multi-prefix"
             ),
-            [Action::Send(String::from("CAP END"))]
+            [
+                Action::Caps(enabled.clone()),
+                Action::Send(String::from("CAP END"))
+            ]
         );
-        assert_eq!(s.enabled, ["message-tags", "server-time", "multi-prefix"]);
+        assert_eq!(s.enabled, enabled);
         // Nothing wanted: end at once.
         let mut other = session();
         assert_eq!(
@@ -1633,9 +1748,50 @@ mod tests {
             handle(&mut late, ":srv CAP ruby NEW :server-time=x"),
             [Action::Send(String::from("CAP REQ :server-time"))]
         );
-        assert!(handle(&mut late, ":srv CAP ruby ACK :server-time").is_empty());
-        handle(&mut late, ":srv CAP ruby DEL :server-time");
+        assert_eq!(
+            handle(&mut late, ":srv CAP ruby ACK :server-time"),
+            [Action::Caps(vec![String::from("server-time")])]
+        );
+        assert_eq!(
+            handle(&mut late, ":srv CAP ruby DEL :server-time"),
+            [Action::Caps(Vec::new())]
+        );
         assert!(late.enabled.is_empty());
+    }
+
+    #[test]
+    fn sts_upgrades_insecure_connections_and_keeps_secure_policies() {
+        // Insecure: the upgrade policy wins, whatever else is offered.
+        let mut insecure =
+            Session::new(&ConnectConfig::new("irc.example.net", 6667, false, "ruby"));
+        assert_eq!(
+            handle(
+                &mut insecure,
+                ":srv CAP * LS :multi-prefix sts=port=6697,duration=300"
+            ),
+            [Action::StsUpgrade(6697)]
+        );
+        // A persistence policy alone on an insecure connection is ignored.
+        let mut ignored = Session::new(&ConnectConfig::new("irc.example.net", 6667, false, "ruby"));
+        assert_eq!(
+            handle(&mut ignored, ":srv CAP * LS :sts=duration=300 multi-prefix"),
+            [Action::Send(String::from("CAP REQ :multi-prefix"))]
+        );
+        // Secure: the duration is kept and negotiation goes on; unknown
+        // keys are skipped, and `sts` is never requested.
+        let mut secure = session();
+        assert_eq!(
+            handle(
+                &mut secure,
+                ":srv CAP * LS :sts=unknown,duration=2592000,port=6697 multi-prefix"
+            ),
+            [
+                Action::StsDuration(2_592_000),
+                Action::Send(String::from("CAP REQ :multi-prefix"))
+            ]
+        );
+        assert_eq!(secure.sts_duration, Some(2_592_000));
+        assert_eq!(sts_policy("port=x,duration=0"), (None, Some(0)));
     }
 
     #[test]

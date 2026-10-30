@@ -12,9 +12,11 @@ PLAIN, SCRAM-SHA-256 and EXTERNAL, NickServ, certificate policies, pins and
 the trust prompt, client certificates, session restore) and M4 (the
 hand-built D-Bus client, the StatusNotifierItem tray and its dbusmenu,
 notifications, closing to the tray, xdg-activation, single instance and
-`irc://` hand-over, the desktop file and icons) are implemented on Linux;
-DESIGN.md §16 lists what each left for later. M5 (modern IRC) is next.
-DESIGN.md §17 records the settled decisions.
+`irc://` hand-over, the desktop file and icons) and M5 (batches,
+echo-message, labeled-response, away and account state, WHOX, MONITOR,
+standard replies, STS, the smart filter, ignores) are implemented on Linux;
+DESIGN.md §16 lists what each left for later. M6 (history and search) is
+next. DESIGN.md §17 records the settled decisions.
 
 ## Binding rules
 
@@ -94,6 +96,13 @@ the user's explicit approval.
   xdg-activation on the running compositor with an unmapped surface.
 - `python3 tools/gen_icons.py` regenerates `assets/desktop/icons/` from the
   logo (ImageMagick).
+- IRCv3 behavior is checked on a local ergo in `scratch/` (download the
+  official release into its own directory and check its SHA-256 against the
+  release's checksum file): plaintext on 127.0.0.1:16670 with STS to TLS on
+  16697 under a self-signed `localhost` certificate, pinned in a scratch
+  `known_hosts`; accounts registered through NickServ, one always-on for
+  bouncer checks. A saved network's `commands` script what RubyChat sends,
+  and a small client with SASL plays the other side.
 - `RUBYCHAT_SNAPSHOTS=DIR cargo test --lib snapshots -- --ignored` writes the
   tab strip, window, context menu, Server Manager, trust prompt and tray
   icon snapshots; `tab-strip-parity.png` uses trust-desktop's preview titles for
