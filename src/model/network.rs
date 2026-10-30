@@ -32,6 +32,9 @@ pub struct Applied {
     pub list: bool,
     /// Lines to send in reply (CTCP).
     pub replies: Vec<String>,
+    /// Buffers that got a line that notifies: a highlight, or a private
+    /// message, by index.
+    pub alerts: Vec<usize>,
 }
 
 impl Applied {
@@ -191,6 +194,11 @@ impl NetworkState {
     }
 
     fn add(&mut self, index: usize, line: Line, applied: &mut Applied) {
+        let private = self.buffers[index].kind == BufferKind::Query
+            && matches!(line.kind, LineKind::Message | LineKind::Action);
+        if !line.own && (line.highlight || private) && !applied.alerts.contains(&index) {
+            applied.alerts.push(index);
+        }
         self.buffers[index].push(line);
         applied.touch(index);
     }
@@ -804,11 +812,13 @@ mod tests {
         let mut network = network();
         apply(&mut network, ":ruby!u@h JOIN #rust");
         let channel = network.find("#rust").unwrap();
-        apply(
+        let applied = apply(
             &mut network,
             ":alice!a@h PRIVMSG #rust :hello Ruby, how are you?",
         );
-        apply(&mut network, ":alice!a@h PRIVMSG @#rust :ops only");
+        assert_eq!(applied.alerts, [channel], "a highlight notifies");
+        let applied = apply(&mut network, ":alice!a@h PRIVMSG @#rust :ops only");
+        assert!(applied.alerts.is_empty());
         apply(&mut network, ":alice!a@h PRIVMSG #rust :rubygems is great");
         let lines = network.buffers[channel].lines();
         assert_eq!(lines.len(), 4);
@@ -818,6 +828,7 @@ mod tests {
         let applied = apply(&mut network, ":bob!b@h PRIVMSG ruby :psst");
         assert!(applied.list, "a query opened");
         let query = network.find("BOB").unwrap();
+        assert_eq!(applied.alerts, [query], "a private message notifies");
         assert_eq!(network.buffers[query].kind, BufferKind::Query);
         assert_eq!(network.buffers[query].highlights, 1);
         apply(

@@ -1155,6 +1155,7 @@ dependencies = [
  "softbuffer",
  "unicode-segmentation",
  "wayland-client",
+ "wayland-protocols",
  "webpki-roots",
  "winit",
 ]

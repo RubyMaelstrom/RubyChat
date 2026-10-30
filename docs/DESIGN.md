@@ -1,6 +1,6 @@
 # RubyChat design
 
-Draft 2 · 30 October 2026 · decisions settled (§17); milestones M0 to M3
+Draft 2 · 30 October 2026 · decisions settled (§17); milestones M0 to M4
 are implemented (§16).
 
 RubyChat is a desktop IRC client written in Rust. Its overriding goal is that
@@ -87,8 +87,9 @@ on its own is 67.
 
 Used directly because winit or rustls already brings them, with the same
 features: libc (Unix), windows-sys (Windows), wayland-client and x11rb
-(clipboard), and aws-lc-rs (SCRAM's SHA-256, HMAC and PBKDF2, randomness,
-and certificate fingerprints).
+(clipboard), wayland-protocols (xdg-activation, to raise the window), and
+aws-lc-rs (SCRAM's SHA-256, HMAC and PBKDF2, randomness, certificate
+fingerprints, and the single-instance key).
 
 Hand-built: the IRC parser, serializer and session state machines; Happy
 Eyeballs connection racing; SOCKS5; SASL PLAIN, SCRAM-SHA-256 and EXTERNAL;
@@ -134,6 +135,9 @@ Adding a crate means adding a row here with its measured transitive cost.
 - Queued work is drained in `about_to_wait`, after the iteration's input
   events, under a time budget (§10). If work remains, the UI posts itself
   another wake, so input that arrives meanwhile is handled first.
+- As built: the desktop thread is one mio poll over the session bus socket
+  and the UI's waker, with no mutex (§12.2). Later launches hand over to an
+  instance thread that sleeps in `accept` (§12.4).
 
 ### 5.2 Who owns what
 
@@ -158,6 +162,13 @@ time, a notification explains that RubyChat is still running in the tray.
 
 Without a tray host, closing quits: each server is sent QUIT, with at most one
 second to flush.
+
+As built: the window is dropped on every platform, X11 included, and the
+next one opens at the size it had, maximized if it was; where it appears is
+the window manager's choice. Showing the window only asks for it, and the
+next wake opens it, so every path (the tray, a notification, a later
+launch) works the same way. While no window exists nothing animates: the
+connecting heartbeat needs a strip to beat in.
 
 ## 6. Networking and IRC
 
@@ -631,7 +642,7 @@ as they're measured.
 | Session: window, order, open buffers, read positions | `$XDG_STATE_HOME/rubychat/session.toml` | `%LOCALAPPDATA%\RubyChat\` |
 | Chat logs | `$XDG_DATA_HOME/rubychat/logs/<network>/<buffer>/<YYYY-MM-DD>.log` | `%LOCALAPPDATA%\RubyChat\logs\` |
 | Font index | `$XDG_CACHE_HOME/rubychat/` | `%LOCALAPPDATA%\RubyChat\cache\` |
-| Single-instance socket and lock | `$XDG_RUNTIME_DIR/` | A named pipe |
+| Single-instance socket and lock | `$XDG_RUNTIME_DIR/rubychat/` | A named pipe |
 
 - Format: a strict TOML subset (tables, arrays of tables, strings, integers,
   booleans, arrays), parsed by hand with line and column errors. The store
@@ -650,7 +661,8 @@ as they're measured.
   with the channels they are in or joining, their queries, the buffer each
   shows and the network shown. It is saved as it changes, with queued saves
   of one file collapsing into the newest, and at exit. Window geometry and
-  read positions are not kept yet; logs arrive with M6. `secrets.toml` is
+  read positions are not kept yet; logs arrive with M6. Since M4 the session
+  also records that closing to the tray has been explained. `secrets.toml` is
   written owner-only from the moment it exists and tightened again if found
   open. A `networks.toml` that fails to load is never written over. Client
   certificate paths are taken as given when absolute, under the home
@@ -701,6 +713,26 @@ require = true
 - The icon, a faceted ruby with neon edges, is drawn in code and pre-rendered
   to ARGB pixmaps from 16 to 64 px.
 
+As built (StatusNotifierItem Specification, KDE's `org.kde.StatusNotifierItem`
+interface, libdbusmenu's `com.canonical.dbusmenu`): the item takes the name
+`org.kde.StatusNotifierItem-PID-1` and registers with KDE's watcher, else the
+freedesktop one, answering both interface names since hosts ask by the
+watcher's family (sfwbar does). It counts as a tray once the watcher reports
+a host (`IsStatusNotifierHostRegistered`, then `StatusNotifierHostRegistered`).
+The icon is the logo's cut gem redrawn for tray sizes, in its pinks with a
+cyan edge: pixel by pixel at 16 px, which sfwbar draws at that size, and as
+vectors with their edges on whole pixels at 18, 20, 22, 24, 32, 48 and 64
+px. (The logo itself, shrunk that far, blurred into a pink blob.) A cyan or
+pink dot ringed in the strip's color marks unread messages or highlights;
+highlights also set `NeedsAttention`. Notifications carry the full logo. The tooltip counts highlights and unread messages. Left
+click hides a focused window (or one that lost the keyboard in the last
+300 ms, as a panel that takes it on a click would cause), brings an
+unfocused one forward (with the host's `ProvideXdgActivationToken` token if
+it sends one, else as a new window) and opens a closed one. The menu at `/MenuBar`: Show or Hide
+RubyChat, Mark all read (disabled with nothing unread), Away (a checkmark;
+servers confirm with 305 and 306) and Quit RubyChat. Not yet: limiting the
+icon to while the window is closed.
+
 ### 12.2 D-Bus
 
 A small client: session-bus address parsing (`unix:path=`, `unix:abstract=`),
@@ -710,6 +742,17 @@ exported objects. One thread reads; writes go through a mutex. Roughly 1,500
 lines with byte-level tests. It also carries notifications and, if wanted
 later, the Secret Service.
 
+As built (`platform/dbus/`, about 1,800 lines with tests): one thread owns
+the connection, so there is no mutex. Connecting, `AUTH EXTERNAL` with the
+numeric user ID and Hello block for at most five seconds each on the desktop
+thread; then the socket is nonblocking under the thread's poll. Writes are
+little-endian; reads accept either byte order and validate strictly
+(padding, UTF-8, booleans, names, paths, signatures, nesting), dropping the
+connection on a malformed message. Messages are capped at 4 MiB, queued
+output at 8 MiB and calls awaiting replies at 256; no file descriptors are
+negotiated. If the bus goes away, the tray and notifications go with it
+until the next start.
+
 ### 12.3 Notifications
 
 Highlights and private messages notify while the window is unfocused or
@@ -718,6 +761,19 @@ notification opens that buffer, passing on the notification server's
 xdg-activation token when it sends one, so the compositor lets the window take
 focus. An open but unfocused window is also marked urgent
 (`request_user_attention`). Windows uses the tray's balloon notifications.
+
+As built (Desktop Notifications Specification): one notification per buffer,
+titled `#rust · Libera.Chat`, which later lines replace (`replaces_id`) to
+show the newest three and a count of earlier ones; a second line waits for
+the first `Notify` to answer rather than racing it. Bodies use `<b>` and
+escapes when the server offers `body-markup` and plain text otherwise; the
+logo goes as `image-data`, with `desktop-entry` `rubychat` and category
+`im.received`. The `default` action opens the buffer with the
+`ActivationToken` that preceded it; a closed notification is forgotten. A
+buffer's notification is withdrawn when it is seen, all of them with Mark
+all read and at quit. Lines older than two minutes by server time (a
+bouncer's playback) don't notify, and urgency is asked once per unfocused
+stretch. Not yet: muting a buffer.
 
 ### 12.4 Single instance and links
 
@@ -729,6 +785,20 @@ X11 class are both `rubychat`. `--tray` starts hidden, for an optional
 autostart entry. Links open with `xdg-open` or `ShellExecuteW` from a worker,
 with per-scheme overrides (for example, `gemini://` and `gopher://` in
 trust-desktop).
+
+As built (`platform/instance.rs`, after trust-desktop's): the lock and
+socket are `$XDG_RUNTIME_DIR/rubychat/instance-<key>.lock` and `.sock`, the
+key a SHA-256 of the executable, the configuration directory and the
+display, so a development build or another profile runs apart. A launch
+sends `RUBYCHAT 1`, then `show`, `token <t>` and `open <address>` lines and
+`end`, and waits for `ok`; lines with control characters are refused. The
+launch's own `XDG_ACTIVATION_TOKEN` or `DESKTOP_STARTUP_ID` travels with it
+and leaves the environment. An address for a server already open joins its
+channel or opens its query there instead of connecting again, at startup
+too. `assets/desktop/` holds `rubychat.desktop` (Desktop Entry 1.5, `Exec=rubychat
+%U`), `rubychat-autostart.desktop` (`--tray`) and hicolor icons from 16 to
+256 px made by `tools/gen_icons.py`; installing them is left to packaging.
+Not yet: the named pipe and tray on Windows (M7).
 
 ### 12.5 Clipboard
 
@@ -790,6 +860,17 @@ the primary selection (middle click) is not supported.
   what the prompt shows, trusted by a pin, refused when the pin changed,
   accepted without verification, and a client certificate presented. The
   Server Manager and the trust prompt have snapshots.
+- Since M4: the wire format against the D-Bus specification's own byte
+  examples, little- and big-endian, with malformed values refused; Hello
+  byte for byte; the desktop thread against a scripted bus (registering
+  with the watcher and waiting for a host, re-registering after a panel
+  restart, a notification clicked with its token, menu clicks, tray
+  signals); the tray's and menu's replies; the tray icon at every size,
+  with `tray_icon_snapshots` for looking at it; notifications coalescing; the
+  single-instance hand-over; and the app headless: closing with and without
+  a tray, notifications and their clicks, tray state, away, and links for
+  an open network. Ignored live tests: `session_bus`, `live_tray` and
+  `activates_a_surface`.
 - Before handoff: `cargo fmt --check`, `cargo clippy --all-targets`,
   `cargo test`, `cargo test --release`, `cargo build --release`.
 - By hand: Libera.Chat and OFTC over TLS; a local ergo for self-signed
@@ -803,7 +884,7 @@ AGENTS.md         working rules
 docs/DESIGN.md    this document
 assets/
   fonts/          JetBrains Mono Regular and Bold (OFL), with license
-  desktop/        rubychat.desktop; generated icons
+  desktop/        rubychat.desktop, rubychat-autostart.desktop; generated icons
 src/
   main.rs         startup, single-instance handoff, event loop
   lib.rs
@@ -817,7 +898,8 @@ src/
                   context_menu, colors, server_manager, switcher, dialog, widgets
   render/         canvas, damage, raster, paint, glyph_cache, text (shape, wrap, bidi),
                   fonts, emoji, present, snapshot (PNG writer)
-  platform/       paths, time, open, clipboard, instance, dbus/, tray/, notify
+  platform/       paths, time, open, clipboard, activation, instance, dbus/, desktop/
+                  (the desktop thread: service, tray, notify)
   config/         TOML subset, settings, networks, secrets, session
   store/          log writer and reader, backlog paging, search
 tests/            scenario tests; fixtures (parser-tests vectors, test certificates)
@@ -851,6 +933,17 @@ several servers moves to the next after a failure, on the link's backoff.
 Not yet: STS (M5), creating client certificates in the app, the broken-lock
 icon on the tab (the sidebar says "TLS UNVERIFIED"), and window geometry in
 the session.
+
+M4's scope is implemented and tested on Linux. Its check passed on labwc with
+sfwbar's tray and mako, against a scripted server and on Libera.Chat over
+TLS: with the window closed to the tray, a highlight brought a notification
+and `NeedsAttention`, and invoking the notification reopened the window on
+that channel. A second launch with an `irc://` link handed it over in 16 ms
+and the running RubyChat joined there on its open connection. Idle with the
+window closed, RubyChat wakes nothing; the paint budgets are unchanged.
+Still 89 crates. Not yet: the Windows tray, notifications and named pipe
+(they come with the Windows build, M7), muting a buffer, showing the icon
+only while the window is closed, and installing the desktop file.
 
 | | Scope | Done when |
 |---|---|---|
@@ -907,6 +1000,21 @@ Settled while building M3:
 15. **Channel keys** of saved networks live in `secrets.toml`, and the
     session keeps none.
 
+Settled while building M4:
+
+16. **The tray icon is the logo's gem drawn for small sizes**, hand-pixeled
+    at 16 px with a cyan edge, plus a dot for unread messages or highlights.
+    The shrunk logo read as a pink blob in the panel; the logo stays on the
+    window, notifications and the desktop entry.
+17. **Closing drops the window** on X11 as on Wayland: one path everywhere,
+    at the cost of the window manager placing the next window.
+18. **The desktop thread polls**, owning the bus connection alone, instead
+    of a reading thread and a write mutex.
+19. **A later launch's address for an open network** joins there rather
+    than connecting a second time; so do the first launch's own addresses.
+20. **The Windows tray waits for the Windows build** (M7), since nothing
+    for Windows is built or tested yet; until then closing quits there.
+
 ## 18. Standards
 
 Read the governing text before implementing; see `web-standards-skill`.
@@ -930,12 +1038,16 @@ M3 follows IRCv3 SASL 3.1 and 3.2, RFC 4616 (PLAIN), RFC 4422 appendix A
 (SASLprep, declined as §17 says), RFC 4648 (base64) and RFC 5280 (the
 certificate fields the trust prompt reads).
 
-Not in the library yet, to be added through the skill's maintenance procedure
-before the milestone that needs them:
-
-- freedesktop: the D-Bus specification, StatusNotifierItem, the dbusmenu
-  interface (libdbusmenu's XML) and Desktop Notifications — M4
-- the Desktop Entry specification — M4
+Added on 30 October 2026 for M4, as documents (see `COVERAGE.md`, "Desktop
+integration sources"): the D-Bus Specification (`dbus-specification-*`), the
+StatusNotifierItem Specification (`status-notifier-item-*`) with KDE's
+interface XML (`kde-status-notifier-item-xml-*`), libdbusmenu's
+`dbus-menu.xml` (`dbusmenu-*`), the Desktop Notifications Specification
+(`notification-spec-*`), the Desktop Entry, MIME applications and Autostart
+specifications (`desktop-entry-spec-*`, `mime-apps-spec-*`,
+`autostart-spec-*`), and the `xdg_activation_v1` protocol
+(`xdg-activation-v1-*`). Windows' `Shell_NotifyIconW` documentation is
+still to be added, before M7 builds the Windows tray.
 
 ## 19. Alternatives considered
 

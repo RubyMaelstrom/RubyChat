@@ -1,0 +1,16 @@
+[Desktop Entry]
+Type=Application
+Version=1.5
+Name=RubyChat
+GenericName=IRC Client
+Comment=Chat on IRC networks
+Exec=rubychat %U
+TryExec=rubychat
+Icon=rubychat
+Terminal=false
+Categories=Network;Chat;IRCClient;
+Keywords=IRC;chat;
+MimeType=x-scheme-handler/irc;x-scheme-handler/ircs;
+StartupNotify=true
+StartupWMClass=rubychat
+SingleMainWindow=true

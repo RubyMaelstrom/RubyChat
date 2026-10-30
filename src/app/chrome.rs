@@ -258,7 +258,7 @@ impl App {
                 }
             }
             (TabStripPart::Maximize, MouseButton::Left) => self.toggle_maximized(),
-            (TabStripPart::Close, MouseButton::Left) => self.quit = true,
+            (TabStripPart::Close, MouseButton::Left) => self.close_window(),
             _ => {}
         }
         true

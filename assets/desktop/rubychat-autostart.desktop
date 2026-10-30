@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Version=1.5
+Name=RubyChat
+Comment=Start RubyChat in the tray at login
+Exec=rubychat --tray
+TryExec=rubychat
+Icon=rubychat
+Terminal=false
+NoDisplay=true

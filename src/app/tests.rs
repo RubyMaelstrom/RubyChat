@@ -603,3 +603,159 @@ fn the_trust_prompt_trusts_once_or_pins() {
     app.answer_certificate(Some(true));
     assert_eq!(app.known_hosts.get("irc.test", 6697), Some([9; 32]));
 }
+
+/// What went to the desktop thread since last asked.
+fn desktop(app: &mut App) -> Vec<crate::platform::desktop::DesktopCommand> {
+    std::mem::take(&mut app.shell.sent)
+}
+
+#[test]
+fn closing_goes_to_the_tray_only_when_one_shows_rubychat() {
+    use crate::platform::desktop::{DesktopCommand, DesktopEvent};
+    let mut app = app();
+    app.close_window();
+    assert!(app.quit, "without a tray, closing quits");
+    let mut app = app_with_tray();
+    app.close_window();
+    assert!(!app.quit && app.shell.hidden, "closed to the tray");
+    let explained = desktop(&mut app)
+        .into_iter()
+        .filter(|command| matches!(command, DesktopCommand::Notify(notice) if notice.key.0 == 0))
+        .count();
+    assert_eq!(explained, 1, "the first time says RubyChat still runs");
+    app.show_window(None);
+    app.close_window();
+    assert!(desktop(&mut app).is_empty(), "only the first time");
+    // The tray going away brings the window back.
+    app.desktop_event(DesktopEvent::Tray(false));
+    assert!(!app.shell.hidden);
+}
+
+fn app_with_tray() -> App {
+    let mut app = app();
+    app.desktop_event(crate::platform::desktop::DesktopEvent::Tray(true));
+    app
+}
+
+#[test]
+fn highlights_notify_and_a_click_opens_their_buffer() {
+    use crate::platform::desktop::{DesktopCommand, DesktopEvent};
+    let mut app = app_with_tray();
+    let id = registered(&mut app);
+    receive(&mut app, id, ":ruby!u@h JOIN #rust");
+    app.close_window();
+    desktop(&mut app);
+    receive(
+        &mut app,
+        id,
+        ":ferris!f@h PRIVMSG #rust :ruby: look at this",
+    );
+    receive(&mut app, id, ":ferris!f@h PRIVMSG #rust :no mention here");
+    receive(
+        &mut app,
+        id,
+        ":alice!a@h PRIVMSG ruby :\u{1}ACTION waves\u{1}",
+    );
+    let notices: Vec<_> = desktop(&mut app)
+        .into_iter()
+        .filter_map(|command| match command {
+            DesktopCommand::Notify(notice) => Some(notice),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(notices.len(), 2);
+    assert_eq!(notices[0].key, (id.0, String::from("#rust")));
+    assert_eq!(notices[0].title, "#rust · Test");
+    assert_eq!(
+        (notices[0].nick.as_str(), notices[0].text.as_str()),
+        ("ferris", "ruby: look at this")
+    );
+    assert_eq!(
+        (notices[1].nick.as_str(), notices[1].text.as_str()),
+        ("", "* alice waves")
+    );
+    // Playback from a bouncer, by server time, doesn't notify.
+    receive(
+        &mut app,
+        id,
+        "@time=2020-01-01T00:00:00.000Z :ferris!f@h PRIVMSG #rust :ruby: old news",
+    );
+    assert!(desktop(&mut app).is_empty());
+    app.desktop_event(DesktopEvent::Open(
+        (id.0, String::from("#rust")),
+        Some(String::from("token")),
+    ));
+    assert_eq!(shown(&app), "#rust");
+    assert!(!app.shell.hidden, "the window comes back");
+    assert_eq!(app.shell.token.as_deref(), Some("token"));
+    // Marking all read withdraws what's up.
+    app.desktop_event(DesktopEvent::Menu(
+        crate::platform::desktop::MenuAction::MarkAllRead,
+    ));
+    let withdrawn = desktop(&mut app)
+        .into_iter()
+        .filter(|command| matches!(command, DesktopCommand::Withdraw(_)))
+        .count();
+    assert_eq!(withdrawn, 2);
+    assert!(network(&app).state.buffers.iter().all(|b| b.unread == 0));
+}
+
+#[test]
+fn the_tray_hears_of_unread_messages_and_away() {
+    use crate::platform::desktop::{Attention, DesktopCommand, DesktopEvent, MenuAction};
+    let mut app = app_with_tray();
+    let id = registered(&mut app);
+    receive(&mut app, id, ":ruby!u@h JOIN #rust");
+    receive(&mut app, id, ":ferris!f@h PRIVMSG #rust :hello");
+    app.sync_tray();
+    let state = desktop(&mut app)
+        .into_iter()
+        .find_map(|command| match command {
+            DesktopCommand::Tray(state) => Some(state),
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!(state.attention, Attention::Unread);
+    assert_eq!(state.tooltip, "1 unread");
+    app.sync_tray();
+    assert!(desktop(&mut app).is_empty(), "sent only when it changes");
+    app.desktop_event(DesktopEvent::Menu(MenuAction::Away));
+    assert_eq!(sent(&app), ["AWAY :Away"]);
+    receive(
+        &mut app,
+        id,
+        ":irc.test 306 ruby :You have been marked as being away",
+    );
+    assert!(app.shell.away);
+    app.desktop_event(DesktopEvent::Menu(MenuAction::Away));
+    assert_eq!(sent(&app), ["AWAY"]);
+    app.desktop_event(DesktopEvent::Menu(MenuAction::Quit));
+    assert!(app.quit);
+}
+
+#[test]
+fn a_later_launchs_link_joins_on_the_network_already_open() {
+    use crate::platform::instance::Request;
+    let mut app = app();
+    let id = registered(&mut app);
+    app.handed_over(Request {
+        show: false,
+        addresses: vec![String::from("ircs://irc.test:6697/rust?key=sesame")],
+        token: Some(String::from("token")),
+    });
+    assert_eq!(app.networks.len(), 1, "no second connection");
+    assert_eq!(sent(&app), ["JOIN #rust sesame"]);
+    assert_eq!(network(&app).id, id);
+    assert_eq!(
+        app.shell.token.as_deref(),
+        Some("token"),
+        "it shows the window"
+    );
+    // Another server connects.
+    app.handed_over(Request {
+        show: true,
+        addresses: vec![String::from("irc.example.org")],
+        token: None,
+    });
+    assert_eq!(app.networks.len(), 2);
+}

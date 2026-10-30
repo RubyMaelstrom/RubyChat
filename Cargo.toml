@@ -47,6 +47,9 @@ libc = "0.2.191"
 # The Wayland clipboard on winit's connection. Already in winit's graph, with
 # the same features.
 wayland-client = { version = "0.31.15", features = ["system", "dlopen"] }
+# xdg-activation-v1, so a notification's click can raise the window. Already
+# in winit's graph, with these features.
+wayland-protocols = { version = "0.32.13", features = ["client", "staging"] }
 
 # The renderer's pixel loops are unusably slow unoptimized; keep debug builds
 # interactive without giving up debug assertions.

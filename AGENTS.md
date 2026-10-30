@@ -7,10 +7,13 @@ the document in the same change when a decision moves.
 Status: milestones M0 (window, renderer, tab strip), M1 (IRC over TCP and
 TLS, the server buffer and input line), M2 (channels and queries, sidebar,
 header, nick list, chat view, commands, completion, Wayland clipboard,
-context menus) and M3 (saved networks and secrets, the Server Manager, SASL
+context menus), M3 (saved networks and secrets, the Server Manager, SASL
 PLAIN, SCRAM-SHA-256 and EXTERNAL, NickServ, certificate policies, pins and
-the trust prompt, client certificates, session restore) are implemented;
-DESIGN.md §16 lists what each left for later. M4 (tray and desktop) is next.
+the trust prompt, client certificates, session restore) and M4 (the
+hand-built D-Bus client, the StatusNotifierItem tray and its dbusmenu,
+notifications, closing to the tray, xdg-activation, single instance and
+`irc://` hand-over, the desktop file and icons) are implemented on Linux;
+DESIGN.md §16 lists what each left for later. M5 (modern IRC) is next.
 DESIGN.md §17 records the settled decisions.
 
 ## Binding rules
@@ -75,10 +78,25 @@ the user's explicit approval.
   use throwaway directories, so the user's next start isn't changed, for
   example `XDG_CONFIG_HOME=$PWD/scratch/xdg/config
   XDG_STATE_HOME=$PWD/scratch/xdg/state target/release/rubychat …`. A
-  `networks.toml` there tries saved networks, logins included.
+  `networks.toml` there tries saved networks, logins included. The single
+  instance is keyed by the executable and configuration directory, so such
+  a run never hands over to the user's own RubyChat (and a second launch
+  with the same directories hands over to the first).
+- The tray and notifications are real D-Bus traffic: `busctl --user` reads
+  the item (`org.kde.StatusNotifierItem-<pid>-1`, `/StatusNotifierItem`,
+  menu at `/MenuBar`; `Event isvu -- 1 clicked s "" 0` clicks Show/Hide)
+  and `makoctl list -j` / `makoctl invoke -n <id> default` see and click
+  notifications. Prefer `--tray` for checks that don't need the window: a
+  window that opens takes the keyboard from whatever the user is doing.
+- `cargo test --lib session_bus -- --ignored --nocapture` says Hello to
+  the session bus; `live_tray` shows a tray item and a notification for a
+  few seconds (`RUBYCHAT_LIVE_SECONDS`); `activates_a_surface` checks
+  xdg-activation on the running compositor with an unmapped surface.
+- `python3 tools/gen_icons.py` regenerates `assets/desktop/icons/` from the
+  logo (ImageMagick).
 - `RUBYCHAT_SNAPSHOTS=DIR cargo test --lib snapshots -- --ignored` writes the
-  tab strip, window, context menu, Server Manager and trust prompt
-  snapshots; `tab-strip-parity.png` uses trust-desktop's preview titles for
+  tab strip, window, context menu, Server Manager, trust prompt and tray
+  icon snapshots; `tab-strip-parity.png` uses trust-desktop's preview titles for
   side-by-side comparison.
 - `--demo` opens placeholder networks with channels, members, formatting,
   links, highlights and unread badges: the whole M2 window without

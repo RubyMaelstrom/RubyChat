@@ -35,6 +35,8 @@ pub struct Session {
     pub networks: Vec<SessionNetwork>,
     /// The network shown.
     pub active: usize,
+    /// Closing the window to the tray has been explained once.
+    pub tray_explained: bool,
 }
 
 impl Session {
@@ -82,12 +84,16 @@ impl Session {
         Ok(Self {
             active: active.min(networks.len().saturating_sub(1)),
             networks,
+            tray_explained: root.boolean("tray_explained").unwrap_or(false),
         })
     }
 
     pub fn to_toml(&self) -> String {
         let mut root = Table::default();
         root.insert("active", Value::Integer(self.active as i64));
+        if self.tray_explained {
+            root.insert("tray_explained", Value::Boolean(true));
+        }
         let tables = self
             .networks
             .iter()
@@ -159,6 +165,7 @@ mod tests {
                 },
             ],
             active: 1,
+            tray_explained: true,
         };
         assert_eq!(Session::parse(&session.to_toml()).unwrap(), session);
         let odd = Session::parse("active = 9\n[[network]]\nhost = \"h\"\nport = 1\n[[network.buffer]]\nkind = \"mystery\"\nname = \"x\"\n[[network]]\nname = \"no host\"\n").unwrap();

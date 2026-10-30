@@ -128,6 +128,7 @@ impl App {
         self.startup.done = true;
         let session = self.startup.session.take().flatten().unwrap_or_default();
         let restore = self.keep_session;
+        self.shell.explained |= session.tray_explained;
         let mut restored = Vec::new();
         for entry in session.networks.iter().filter(|_| restore) {
             if entry.name.is_empty() {
@@ -154,9 +155,10 @@ impl App {
                 }
             }
         }
+        // An address for a network the session opened joins it there.
         for address in std::mem::take(&mut self.startup.addresses) {
             match commands::parse_server(&address) {
-                Ok(server) => self.connect(server),
+                Ok(server) => self.open_address(server),
                 Err(message) => self.prompt_message = Some(message),
             }
         }
@@ -412,7 +414,11 @@ impl App {
                 },
             });
         }
-        Session { networks, active }
+        Session {
+            networks,
+            active,
+            tray_explained: self.shell.explained,
+        }
     }
 
     pub(super) fn session_changed(&mut self) {

@@ -13,6 +13,7 @@ mod demo;
 mod manager;
 mod menus;
 mod present;
+mod shell;
 mod startup;
 #[cfg(test)]
 mod tests;
@@ -42,6 +43,8 @@ use crate::model::{Line, LineKind};
 use crate::net::{ConnectConfig, LinkStatus, NetCommand, NetEvent, NetHandle, NetworkId};
 #[cfg(all(unix, not(target_vendor = "apple")))]
 use crate::platform::clipboard::Clipboard;
+use crate::platform::desktop::{Desktop, DesktopEvent};
+use crate::platform::instance::Request;
 use crate::platform::time::now_ms;
 use crate::render::{Canvas, Damage, Painter, Point, Rect, TextSystem};
 use crate::store::{Document, Store, StoreEvent};
@@ -77,15 +80,21 @@ const NET_BUDGET: Duration = Duration::from_millis(4);
 const DOUBLE_CLICK: Duration = Duration::from_millis(450);
 const DOUBLE_CLICK_SLOP: f32 = 4.0;
 
-#[derive(Clone, Debug, Default)]
+#[derive(Debug, Default)]
 pub struct Options {
     /// Open placeholder networks, to try the interface without connecting.
     pub demo: bool,
     /// Servers to connect to at startup, as quick connect reads them.
     pub connect: Vec<String>,
-    /// Run without the network and store threads, touching neither the
-    /// network nor the disk, as tests do.
+    /// Run without the network, store and desktop threads, touching
+    /// neither the network nor the disk, as tests do.
     pub isolated: bool,
+    /// Start in the tray, without a window (`--tray`).
+    pub tray: bool,
+    /// The launch's activation token, for the first window.
+    pub token: Option<String>,
+    /// The socket later launches hand over to.
+    pub instance: Option<crate::platform::instance::Server>,
 }
 
 /// Wakes the event loop from other threads.
@@ -149,10 +158,11 @@ pub fn run(options: Options) -> Result<(), String> {
     // What was open, for next time, while it still is.
     app.session_changed();
     app.save_session();
-    // Dropping the handles says QUIT to every server and finishes pending
-    // writes.
+    // Dropping the handles says QUIT to every server, finishes pending
+    // writes and withdraws notifications.
     drop(app.net.take());
     drop(app.store.take());
+    drop(app.shell.desktop.take());
     if let Some(path) = std::env::var_os("RUBYCHAT_SNAPSHOT")
         && let Some(view) = &app.view
     {
@@ -333,6 +343,11 @@ pub struct App {
     net_inbox: Inbox<NetEvent>,
     store: Option<Store>,
     store_inbox: Inbox<StoreEvent>,
+    desktop_inbox: Inbox<DesktopEvent>,
+    /// Requests from later launches.
+    instance_inbox: Inbox<Request>,
+    /// The tray, notifications and the window's comings and goings.
+    shell: shell::Shell,
     /// Inbox events wait to be drained after this wake's input.
     inbox_ready: bool,
     /// Wakes the event loop to drain what one wake's budget left.
@@ -404,6 +419,8 @@ struct View {
     /// Pointer position in logical pixels.
     pointer: Point,
     focused: bool,
+    /// When the window last lost the keyboard.
+    unfocused_at: Option<Instant>,
     cursor: CursorIcon,
     dirty: Dirty,
 }
@@ -462,14 +479,34 @@ impl App {
     pub fn new(options: Options, waker: impl Fn() -> Wake + 'static) -> Result<Self, String> {
         let (net_sink, net_inbox) = Inbox::new(waker());
         let (store_sink, store_inbox) = Inbox::new(waker());
+        let (desktop_sink, desktop_inbox) = Inbox::new(waker());
+        let (instance_sink, instance_inbox) = Inbox::new(waker());
+        let mut shell = shell::Shell::default();
         let (net, store) = if options.isolated {
             (None, None)
         } else {
             let net = NetHandle::spawn(net_sink).map_err(|e| format!("network thread: {e}"))?;
             let store = Store::spawn(store_sink).map_err(|e| format!("store thread: {e}"))?;
             store.load(Document::Recent);
+            let artwork = crate::platform::desktop::Artwork {
+                tray: crate::ui::branding::tray_icon,
+                logo: crate::ui::branding::logo_rgba,
+            };
+            match Desktop::spawn(desktop_sink, artwork) {
+                Ok(desktop) => shell.desktop = Some(desktop),
+                Err(error) => eprintln!("rubychat: no tray or notifications: {error}"),
+            }
             (Some(net), Some(store))
         };
+        if let Some(server) = options.instance
+            && let Err(error) = server.serve(instance_sink)
+        {
+            eprintln!("rubychat: later launches can't hand over: {error}");
+        }
+        // Starting in the tray waits to hear whether there is one; with no
+        // desktop thread there isn't.
+        shell.hidden = options.tray && shell.desktop.is_some();
+        shell.token = options.token;
         let mut app = Self {
             text: TextSystem::new(),
             networks: Vec::new(),
@@ -488,6 +525,9 @@ impl App {
             net_inbox,
             store,
             store_inbox,
+            desktop_inbox,
+            instance_inbox,
+            shell,
             inbox_ready: false,
             wake: waker(),
             #[cfg(test)]
@@ -576,18 +616,31 @@ impl App {
     }
 
     fn open_window(&mut self, event_loop: &ActiveEventLoop) -> Result<(), String> {
+        // The size it had when it last closed to the tray.
+        let (width, height, maximized) =
+            self.shell
+                .geometry
+                .unwrap_or((DEFAULT_SIZE.0, DEFAULT_SIZE.1, false));
         let mut attributes = Window::default_attributes()
             .with_title("RubyChat")
             // The tab strip is the title bar (`chrome`).
             .with_decorations(false)
-            .with_inner_size(LogicalSize::new(DEFAULT_SIZE.0, DEFAULT_SIZE.1))
+            .with_inner_size(LogicalSize::new(width, height))
+            .with_maximized(maximized)
             .with_min_inner_size(LogicalSize::new(MINIMUM_SIZE.0, MINIMUM_SIZE.1));
         #[cfg(all(unix, not(target_vendor = "apple")))]
         {
+            use winit::platform::startup_notify::WindowAttributesExtStartupNotify;
             use winit::platform::wayland::WindowAttributesExtWayland;
             use winit::platform::x11::WindowAttributesExtX11;
             attributes = WindowAttributesExtWayland::with_name(attributes, APP_ID, APP_ID);
             attributes = WindowAttributesExtX11::with_name(attributes, APP_ID, APP_ID);
+            // A token from a notification, the tray or a launch lets the
+            // new window take focus (xdg-activation-v1).
+            if let Some(token) = self.shell.token.take() {
+                attributes = attributes
+                    .with_activation_token(winit::window::ActivationToken::from_raw(token));
+            }
         }
         let window = Rc::new(
             event_loop
@@ -615,6 +668,7 @@ impl App {
             presenter,
             pointer: Point::new(-1.0, -1.0),
             focused: true,
+            unfocused_at: None,
             cursor: CursorIcon::Default,
             dirty: Dirty::ALL,
         });
@@ -756,6 +810,7 @@ impl App {
         let focused = self.view.as_ref().is_some_and(|view| view.focused);
         let welcome = self.welcome_visible();
         let mut changed = false;
+        let mut seen_now = Vec::new();
         for (n, network) in self.networks.iter_mut().enumerate() {
             let shown = n == self.active && !welcome && focused;
             for (b, buffer) in network.state.buffers.iter_mut().enumerate() {
@@ -763,11 +818,14 @@ impl App {
                 if seen && !buffer.seen {
                     changed |= buffer.unread > 0 || buffer.activity != Default::default();
                     buffer.set_seen(true);
+                    seen_now.push((network.id.0, buffer.key.clone()));
                 } else if !seen && buffer.seen {
                     buffer.leave();
                 }
             }
         }
+        seen_now.retain(|key| self.noticed(key));
+        self.withdraw_seen(seen_now);
         if changed {
             self.mark_strip();
             self.mark_sidebar();
@@ -948,11 +1006,14 @@ impl App {
         self.session_changed();
     }
 
-    /// Whether anything is animating: only a connecting network's jewel.
+    /// Whether anything is animating: only a connecting network's jewel,
+    /// and only while there's a window to show it.
     fn animating(&self) -> bool {
-        self.networks
-            .iter()
-            .any(|network| network.tab(false).status == TabStatus::Connecting)
+        self.view.is_some()
+            && self
+                .networks
+                .iter()
+                .any(|network| network.tab(false).status == TabStatus::Connecting)
     }
 
     /// Applies the store's events, then network events until they run out
@@ -1220,6 +1281,8 @@ impl App {
         if renamed && self.is_shown(index) {
             self.mark_input();
         }
+        self.alert(index, &applied.alerts);
+        self.away_reply(message.command());
     }
 
     /// Marks what a change to network `index` touched. `badge` is the
@@ -2169,23 +2232,23 @@ impl ApplicationHandler<AppEvent> for App {
                 && let RawDisplayHandle::Wayland(wayland) = handle.as_raw()
             {
                 // SAFETY: the display is the event loop's connection, and the
-                // clipboard is dropped in `exiting`, while it is still open.
+                // clipboard and activation are dropped in `exiting`, while
+                // it is still open.
                 self.clipboard = Some(unsafe { Clipboard::new(wayland.display) });
+                self.shell.activation =
+                    Some(unsafe { crate::platform::activation::Activation::new(wayland.display) });
             }
         }
-        if self.view.is_none() {
-            if let Err(error) = self.open_window(event_loop) {
-                self.failure = Some(error);
-                event_loop.exit();
-            }
-            self.update_title();
-        }
+        self.ensure_window(event_loop);
     }
 
     fn exiting(&mut self, _event_loop: &ActiveEventLoop) {
-        // While the connection it shares is still open.
+        // While the connection they share is still open.
         #[cfg(all(unix, not(target_vendor = "apple")))]
-        drop(self.clipboard.take());
+        {
+            drop(self.clipboard.take());
+            drop(self.shell.activation.take());
+        }
     }
 
     fn user_event(&mut self, _event_loop: &ActiveEventLoop, event: AppEvent) {
@@ -2196,12 +2259,12 @@ impl ApplicationHandler<AppEvent> for App {
 
     fn window_event(
         &mut self,
-        event_loop: &ActiveEventLoop,
+        _event_loop: &ActiveEventLoop,
         _window: WindowId,
         event: WindowEvent,
     ) {
         match event {
-            WindowEvent::CloseRequested => event_loop.exit(),
+            WindowEvent::CloseRequested => self.close_window(),
             WindowEvent::RedrawRequested => self.redraw(),
             WindowEvent::Resized(_) => self.mark_all(),
             WindowEvent::ScaleFactorChanged { scale_factor, .. } => {
@@ -2213,6 +2276,12 @@ impl ApplicationHandler<AppEvent> for App {
             WindowEvent::Focused(focused) => {
                 if let Some(view) = &mut self.view {
                     view.focused = focused;
+                    if !focused {
+                        view.unfocused_at = Some(Instant::now());
+                    }
+                }
+                if focused {
+                    self.shell.attention = false;
                 }
                 if !focused {
                     self.close_menu();
@@ -2333,6 +2402,24 @@ impl ApplicationHandler<AppEvent> for App {
         if self.inbox_ready {
             self.drain_inbox();
         }
+        self.desktop_inbox.arm();
+        while let Some(event) = self.desktop_inbox.next() {
+            self.desktop_event(event);
+        }
+        self.instance_inbox.arm();
+        while let Some(request) = self.instance_inbox.next() {
+            self.handed_over(request);
+        }
+        if self.quit {
+            event_loop.exit();
+            return;
+        }
+        self.ensure_window(event_loop);
+        #[cfg(all(unix, not(target_vendor = "apple")))]
+        if let Some(activation) = &mut self.shell.activation {
+            activation.dispatch();
+        }
+        self.sync_tray();
         self.save_session();
         #[cfg(all(unix, not(target_vendor = "apple")))]
         if let Some(clipboard) = &mut self.clipboard {
