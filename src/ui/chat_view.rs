@@ -6,6 +6,7 @@
 //! Only the lines in view are laid out. A scrolled view rests on an anchor
 //! line, so arriving lines and width changes never move what you're reading.
 
+use std::borrow::Cow;
 use std::collections::VecDeque;
 use std::ops::Range;
 
@@ -13,6 +14,7 @@ use crate::irc::casemap::Casemap;
 use crate::irc::format::{self, Formatted};
 use crate::model::buffer::Anchor;
 use crate::model::links::{find_channels, find_links, target};
+use crate::model::search::Query;
 use crate::model::{Line, LineKind};
 use crate::platform::time;
 use crate::render::paragraph::{self, Paragraph};
@@ -43,6 +45,8 @@ const RULE_HEIGHT: f32 = 26.0;
 const FILTER_LOOKBACK: usize = 256;
 /// Selected text's background.
 pub const SELECTION: Color = Color::rgba(0x6e, 0x4e, 0x9e, 150);
+/// Search matches' background; the current match is solid amber.
+const MATCH: Color = Color::rgba(0xff, 0xb0, 0x00, 70);
 
 /// Chat text: monospaced and without ligatures, so `->` stays two
 /// characters and ASCII takes the shaping fast path.
@@ -74,6 +78,8 @@ pub struct ChatContext<'a> {
     pub label_chars: usize,
     /// The smart filter hides quiet lines.
     pub filter: bool,
+    /// Earlier lines are on their way: the oldest line says so.
+    pub loading: bool,
 }
 
 impl ChatContext<'_> {
@@ -184,6 +190,49 @@ fn show_controls(formatted: &mut Formatted) {
     formatted.text = text;
 }
 
+/// Whether a line's text is read for mIRC formatting.
+fn formatting(line: &Line) -> bool {
+    matches!(
+        line.kind,
+        LineKind::Message | LineKind::Action | LineKind::Notice
+    )
+}
+
+/// A line's message column as shown: formatting read, control characters
+/// made visible, and an action led by its nick, whose range comes too.
+fn shown(line: &Line) -> (Formatted, Range<usize>) {
+    let mut formatted = if formatting(line) {
+        format::parse(&line.text)
+    } else {
+        Formatted {
+            text: line.text.clone(),
+            spans: Vec::new(),
+        }
+    };
+    show_controls(&mut formatted);
+    // An action reads "nick waves": the nick leads the text.
+    let mut lead = 0..0;
+    if line.kind == LineKind::Action {
+        let nick = format!("{} ", line.nick);
+        lead = 0..line.nick.len();
+        for (range, _) in &mut formatted.spans {
+            *range = range.start + nick.len()..range.end + nick.len();
+        }
+        formatted.text.insert_str(0, &nick);
+    }
+    (formatted, lead)
+}
+
+/// A line's message column as shown, for searching: offsets into it are
+/// offsets into the laid-out text.
+pub fn shown_text(line: &Line) -> Cow<'_, str> {
+    // Without control characters, nothing changes but an action's lead.
+    if line.kind != LineKind::Action && !line.text.chars().any(|c| c.is_ascii_control()) {
+        return Cow::Borrowed(&line.text);
+    }
+    Cow::Owned(shown(line).0.text)
+}
+
 fn weekday(year: i32, month: u8, day: u8) -> &'static str {
     const DAYS: [&str; 7] = [
         "THURSDAY",
@@ -251,39 +300,23 @@ fn layout_block(
         .rev()
         .take(FILTER_LOOKBACK)
         .find(|&earlier| !context.hidden(&lines[earlier]));
-    let new_day = previous
-        .or(index.checked_sub(1))
-        .is_some_and(|earlier| !same_day(lines[earlier].time, line.time));
+    // History at the top says which day it's from.
+    let new_day = match previous.or(index.checked_sub(1)) {
+        Some(earlier) => !same_day(lines[earlier].time, line.time),
+        None => line.history,
+    };
     let rule = match (context.marker == Some(line.id), new_day) {
+        _ if context.loading && index == 0 => {
+            Some((String::from("LOADING EARLIER MESSAGES"), false))
+        }
         (true, true) => Some((format!("NEW MESSAGES · {}", day_label(line.time)), true)),
         (true, false) => Some((String::from("NEW MESSAGES"), true)),
         (false, true) => Some((day_label(line.time), false)),
         (false, false) => None,
     };
     let (_, base) = colors(line, context.casemap);
-    let formatting = matches!(
-        line.kind,
-        LineKind::Message | LineKind::Action | LineKind::Notice
-    );
-    let mut formatted = if formatting {
-        format::parse(&line.text)
-    } else {
-        Formatted {
-            text: line.text.clone(),
-            spans: Vec::new(),
-        }
-    };
-    show_controls(&mut formatted);
-    // An action reads "nick waves": the nick leads the text.
-    let mut lead = 0..0;
-    if line.kind == LineKind::Action {
-        let nick = format!("{} ", line.nick);
-        lead = 0..line.nick.len();
-        for (range, _) in &mut formatted.spans {
-            *range = range.start + nick.len()..range.end + nick.len();
-        }
-        formatted.text.insert_str(0, &nick);
-    }
+    let formatting = formatting(line);
+    let (formatted, lead) = shown(line);
     let plain = formatted.text;
     let mut links: Vec<(Range<usize>, Target)> = find_links(&plain)
         .into_iter()
@@ -514,6 +547,17 @@ impl ChatFrame {
         }
     }
 
+    /// Whether line `id` showed whole.
+    pub fn shows(&self, id: u64) -> bool {
+        let Some(columns) = self.columns else {
+            return false;
+        };
+        self.shown.iter().any(|line| {
+            let bottom = line.top + line.paragraph.row_count() as f32 * columns.row_height;
+            line.id == id && line.top >= self.rect.y && bottom <= self.rect.bottom()
+        })
+    }
+
     /// The nick whose label is under `point`.
     pub fn nick_at(&self, point: Point) -> Option<&str> {
         let columns = self.columns?;
@@ -587,6 +631,13 @@ pub fn ordered(a: TextPosition, b: TextPosition) -> (TextPosition, TextPosition)
     if a <= b { (a, b) } else { (b, a) }
 }
 
+/// Search matches to highlight: every occurrence of the query in view, and
+/// the current one, by line and range in its text as shown.
+pub struct Found<'a> {
+    pub query: &'a Query,
+    pub current: Option<(u64, Range<usize>)>,
+}
+
 /// What to paint.
 pub struct ChatView<'a> {
     pub lines: &'a VecDeque<Line>,
@@ -595,6 +646,7 @@ pub struct ChatView<'a> {
     pub selection: Option<(TextPosition, TextPosition)>,
     /// The link under the pointer.
     pub hovered: Option<(u64, Range<usize>)>,
+    pub found: Option<Found<'a>>,
     pub focused: bool,
 }
 
@@ -846,8 +898,8 @@ pub fn paint_chat(
     frame
 }
 
-/// A copy of `block`'s layout with the selection and the hovered link, if
-/// either touches it.
+/// A copy of `block`'s layout with search matches, the selection and the
+/// hovered link, if any touches it.
 fn decorated(block: &Block, id: u64, view: &ChatView<'_>) -> Option<Paragraph> {
     let selected = view.selection.and_then(|(start, end)| {
         if id < start.id || id > end.id {
@@ -866,12 +918,31 @@ fn decorated(block: &Block, id: u64, view: &ChatView<'_>) -> Option<Paragraph> {
         .as_ref()
         .filter(|(line, _)| *line == id)
         .map(|(_, range)| range.clone());
-    if selected.is_none() && hovered.is_none() {
+    let found = view
+        .found
+        .as_ref()
+        .map(|found| found.query.find(&block.plain))
+        .unwrap_or_default();
+    if selected.is_none() && hovered.is_none() && found.is_empty() {
         return None;
     }
+    let current = view
+        .found
+        .as_ref()
+        .and_then(|found| found.current.as_ref())
+        .filter(|(line, _)| *line == id)
+        .map(|(_, range)| range);
     let mut paragraph = block.paragraph.clone();
     for placed in &mut paragraph.glyphs {
         let cluster = placed.glyph.cluster as usize;
+        if found.iter().any(|range| range.contains(&cluster)) {
+            if current.is_some_and(|range| range.contains(&cluster)) {
+                placed.decoration.background = Some(AMBER);
+                placed.color = CANVAS;
+            } else {
+                placed.decoration.background = Some(MATCH);
+            }
+        }
         if selected
             .as_ref()
             .is_some_and(|range| range.contains(&cluster))
@@ -1004,6 +1075,7 @@ mod tests {
             marker: None,
             label_chars: 6,
             filter: true,
+            loading: false,
         }
     }
 
@@ -1028,6 +1100,7 @@ mod tests {
             anchor,
             selection: None,
             hovered: None,
+            found: None,
             focused: true,
         };
         paint_chat(
@@ -1037,6 +1110,56 @@ mod tests {
             ChatFrame::default(),
             false,
         )
+    }
+
+    #[test]
+    fn search_matches_are_highlighted_and_the_current_one_stands_out() {
+        let mut lines = lines(2);
+        lines[0].text = String::from("find me, find me");
+        lines[1].text = String::from("\u{2}find\u{2} me too");
+        let query = Query::new("FIND").unwrap();
+        let mut canvas = Canvas::new(500, 200);
+        let mut text = TextSystem::new();
+        let mut painter = Painter::new(&mut canvas, &mut text, 1.0);
+        let view = ChatView {
+            lines: &lines,
+            context: context(),
+            anchor: None,
+            selection: None,
+            hovered: None,
+            found: Some(Found {
+                query: &query,
+                current: Some((1, 9..13)),
+            }),
+            focused: true,
+        };
+        let frame = paint_chat(
+            &mut painter,
+            Rect::new(0.0, 0.0, 500.0, 200.0),
+            &view,
+            ChatFrame::default(),
+            false,
+        );
+        let columns = frame.columns.unwrap();
+        // The background behind a character's cell, a pixel inside it.
+        let behind = |id: u64, offset: usize| {
+            let line = frame.shown.iter().find(|line| line.id == id).unwrap();
+            let glyph = line
+                .paragraph
+                .glyphs
+                .iter()
+                .find(|placed| placed.glyph.cluster as usize == offset)
+                .unwrap();
+            canvas.pixel(
+                (columns.text_x + glyph.glyph.x + 1.0) as u32,
+                (line.top + 2.0) as u32,
+            )
+        };
+        assert_eq!(behind(1, 9), AMBER.pixel(), "the current match");
+        assert_ne!(behind(1, 0), CANVAS.pixel(), "another match");
+        assert_ne!(behind(1, 0), AMBER.pixel());
+        assert_eq!(behind(1, 5), CANVAS.pixel(), "no match");
+        assert_ne!(behind(2, 0), CANVAS.pixel(), "found past its formatting");
     }
 
     #[test]
@@ -1074,6 +1197,7 @@ mod tests {
             anchor: None,
             selection: None,
             hovered: None,
+            found: None,
             focused: true,
         };
         let all = paint_chat(
@@ -1298,6 +1422,7 @@ mod tests {
             anchor: None,
             selection: None,
             hovered: None,
+            found: None,
             focused: true,
         };
         let frame = paint_chat(
@@ -1355,6 +1480,7 @@ mod tests {
                 TextPosition { id: 58, offset: 4 },
             )),
             hovered: None,
+            found: None,
             focused: true,
         };
         for scale in [1.0f32, 1.5, 2.0] {

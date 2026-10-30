@@ -269,6 +269,7 @@ pub fn paint_welcome(
         "ruby\u{203a}",
         "irc.libera.chat:6697",
         true,
+        None,
     );
 
     let status_y = panel.y + 89.0;

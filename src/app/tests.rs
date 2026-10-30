@@ -870,3 +870,216 @@ fn sts_policies_upgrade_later_connections() {
     assert!(connect.tls);
     assert_eq!(connect.port, 6697);
 }
+
+#[test]
+fn history_comes_from_the_server_once_it_is_known_to_keep_one() {
+    let mut app = app();
+    let id = app.add_network(
+        String::from("Test"),
+        ConnectConfig::new("irc.test", 6697, true, "ruby"),
+    );
+    app.apply(NetEvent::Status(id, LinkStatus::Connecting));
+    let rust = {
+        let state = &mut app.networks[0].state;
+        state.open(BufferKind::Channel, "#rust").0
+    };
+    app.activate_buffer(rust);
+    assert!(
+        app.networks[0].state.buffers[rust].history.deferred,
+        "it waits to learn whether the server keeps history"
+    );
+    assert!(sent(&app).is_empty());
+    let caps = ["batch", "draft/chathistory", "draft/read-marker"];
+    app.apply(NetEvent::Caps(
+        id,
+        caps.iter().map(|cap| cap.to_string()).collect(),
+    ));
+    receive(
+        &mut app,
+        id,
+        ":irc.test 005 ruby CHATHISTORY=50 :are supported",
+    );
+    app.apply(NetEvent::Status(
+        id,
+        LinkStatus::Registered {
+            nick: String::from("ruby"),
+        },
+    ));
+    let lines = sent(&app);
+    assert!(
+        lines.contains(&String::from("CHATHISTORY LATEST #rust * 50")),
+        "{lines:?}"
+    );
+    assert!(app.networks[0].state.buffers[rust].history.loading);
+    // The answer arrives; scrolling back asks for what came before it.
+    receive(&mut app, id, ":irc.test BATCH +h chathistory #rust");
+    receive(
+        &mut app,
+        id,
+        "@batch=h;time=2026-10-30T12:00:00.000Z :alice!a@h PRIVMSG #rust :earlier",
+    );
+    receive(&mut app, id, ":irc.test BATCH -h");
+    assert!(!app.networks[0].state.buffers[rust].history.loading);
+    app.request_history(0, rust);
+    assert_eq!(
+        sent(&app),
+        ["CHATHISTORY BEFORE #rust timestamp=2026-10-30T12:00:00.000Z 50"]
+    );
+}
+
+#[test]
+fn search_finds_in_place_and_goes_on_into_earlier_history() {
+    let mut app = app();
+    let id = registered(&mut app);
+    let caps = ["batch", "draft/chathistory"];
+    app.apply(NetEvent::Caps(
+        id,
+        caps.iter().map(|cap| cap.to_string()).collect(),
+    ));
+    receive(&mut app, id, ":ruby!u@h JOIN #rust");
+    receive(&mut app, id, ":alice!a@h PRIVMSG #rust :zeta is fun");
+    receive(&mut app, id, ":bob!b@h PRIVMSG #rust :so is irc");
+    receive(&mut app, id, ":alice!a@h PRIVMSG #rust :Zeta and zeta");
+    let rust = app.networks[0].state.find("#rust").unwrap();
+    app.activate_buffer(rust);
+    // Showing it asked for the latest history: a line comes.
+    let lines = sent(&app);
+    assert!(
+        lines
+            .iter()
+            .any(|line| line.contains("CHATHISTORY LATEST #rust"))
+    );
+    receive(&mut app, id, ":irc.test BATCH +l chathistory #rust");
+    receive(
+        &mut app,
+        id,
+        "@batch=l;time=2021-01-01T00:00:00.000Z :dave!d@h PRIVMSG #rust :hello",
+    );
+    receive(&mut app, id, ":irc.test BATCH -l");
+    // Typing finds the nearest, the newest line's later occurrence.
+    app.open_find(Some("ZETA"));
+    let newest = app.networks[0].buffer().lines().back().unwrap().id;
+    assert_eq!(app.current_match(), Some((newest, 9..13)));
+    app.find_step(true);
+    assert_eq!(app.current_match(), Some((newest, 0..4)));
+    app.find_step(true);
+    assert_eq!(app.current_match().map(|(_, range)| range), Some(0..4));
+    assert_ne!(app.current_match().map(|(line, _)| line), Some(newest));
+    // Past the oldest line, the server is asked for what came before.
+    app.find_step(true);
+    let lines = sent(&app);
+    assert!(
+        lines.iter().any(|line| line.starts_with("CHATHISTORY ")),
+        "{lines:?}"
+    );
+    assert_eq!(
+        app.find.as_ref().and_then(|find| find.note),
+        Some("SEARCHING EARLIER MESSAGES")
+    );
+    receive(&mut app, id, ":irc.test BATCH +h chathistory #rust");
+    receive(
+        &mut app,
+        id,
+        "@batch=h;time=2020-01-01T00:00:00.000Z :carol!c@h PRIVMSG #rust :old zeta news",
+    );
+    receive(&mut app, id, ":irc.test BATCH -h");
+    app.find_resume();
+    let oldest = app.networks[0].buffer().lines().front().unwrap().id;
+    assert_eq!(app.current_match(), Some((oldest, 4..8)));
+    assert_eq!(app.find.as_ref().and_then(|find| find.note), None);
+    // Later matches lead back; past the newest there are none.
+    app.find_step(false);
+    app.find_step(false);
+    app.find_step(false);
+    app.find_step(false);
+    assert_eq!(app.current_match(), Some((newest, 9..13)));
+    app.find_step(false);
+    assert_eq!(
+        app.find.as_ref().and_then(|find| find.note),
+        Some("NO LATER MATCHES")
+    );
+    // Other text: nothing loaded matches, and the server may have more.
+    app.open_find(Some("zebra"));
+    assert_eq!(app.current_match(), None);
+    assert_eq!(
+        app.find.as_ref().and_then(|find| find.note),
+        Some("NO MATCHES · ENTER SEARCHES EARLIER")
+    );
+    app.close_find();
+    assert!(app.find.is_none());
+}
+
+#[test]
+fn the_channel_list_streams_in_filters_sorts_and_joins() {
+    let mut app = app();
+    let id = registered(&mut app);
+    sent(&app);
+    type_line(&mut app, "/list");
+    assert_eq!(sent(&app), ["LIST"], "unlabeled, so nothing holds it back");
+    assert!(app.browsing());
+    receive(&mut app, id, ":irc.test 321 ruby Channel :Users  Name");
+    receive(
+        &mut app,
+        id,
+        ":irc.test 322 ruby #small 3 :a \u{3}4red\u{3} topic",
+    );
+    receive(
+        &mut app,
+        id,
+        ":irc.test 322 ruby #rust 900 :The Rust language",
+    );
+    receive(&mut app, id, ":irc.test 322 ruby #rusty 40 :Old cars");
+    app.step_channels(Instant::now() + Duration::from_secs(1));
+    let names = |app: &App| -> Vec<String> {
+        let list = app.networks[0].state.channels.as_ref().unwrap();
+        list.rows()
+            .iter()
+            .map(|&index| list.channel(index).unwrap().name().to_string())
+            .collect()
+    };
+    assert_eq!(names(&app), ["#rust", "#rusty", "#small"]);
+    assert!(app.channels_detail().contains("loading"));
+    receive(&mut app, id, ":irc.test 323 ruby :End of /LIST");
+    assert_eq!(app.channels_detail(), "3 channels");
+    // Nothing went to the server buffer.
+    assert!(
+        app.networks[0].state.buffers[0]
+            .lines()
+            .iter()
+            .all(|line| !line.text.contains("#small"))
+    );
+    // The filter is typed in the input row.
+    app.editor().set("RUST");
+    app.channels_edited();
+    while app.networks[0].state.channels.as_ref().unwrap().busy() {
+        app.step_channels(Instant::now() + Duration::from_secs(1));
+    }
+    assert_eq!(names(&app), ["#rust", "#rusty"]);
+    assert_eq!(app.channels_detail(), "2 of 3 channels");
+    app.sort_channels(Order::Name);
+    while app.networks[0].state.channels.as_ref().unwrap().busy() {
+        app.step_channels(Instant::now() + Duration::from_secs(1));
+    }
+    assert_eq!(names(&app), ["#rust", "#rusty"]);
+    // Down selects the first row, again the next; Enter joins it.
+    app.move_selection(1);
+    app.move_selection(1);
+    app.join_selected();
+    assert_eq!(sent(&app), ["JOIN #rusty"]);
+    assert!(!app.browsing());
+    assert_eq!(shown(&app), "#rusty");
+    // A list ended early says why.
+    type_line(&mut app, "/list >10");
+    assert_eq!(sent(&app), ["LIST >10"]);
+    receive(
+        &mut app,
+        id,
+        ":irc.test 263 ruby LIST :Server load is temporarily too heavy",
+    );
+    let list = app.networks[0].state.channels.as_ref().unwrap();
+    assert!(!list.loading);
+    assert_eq!(
+        list.error.as_deref(),
+        Some("Server load is temporarily too heavy")
+    );
+}

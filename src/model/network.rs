@@ -13,6 +13,7 @@ use crate::irc::{Message, serialize, split_source};
 use crate::platform::time;
 
 use super::buffer::{Buffer, BufferKind};
+use super::channels::ChannelList;
 use super::members::Member;
 use super::{Line, LineKind, describe, message_time};
 
@@ -36,6 +37,10 @@ pub struct Applied {
     /// Buffers that got a line that notifies: a highlight, or a private
     /// message, by index.
     pub alerts: Vec<usize>,
+    /// Buffers read elsewhere (IRCv3 read-marker), by index.
+    pub read: Vec<usize>,
+    /// The channel list grew or ended.
+    pub channels: bool,
 }
 
 impl Applied {
@@ -119,6 +124,8 @@ struct Incoming<'a> {
     label: Option<&'a str>,
     /// The sender's account (IRCv3 account-tag).
     account: Option<String>,
+    /// The server's ID for it (IRCv3 message-ids).
+    msgid: Option<String>,
 }
 
 /// A batch being received (IRCv3 batch).
@@ -129,6 +136,8 @@ struct Batch {
     parent: Option<String>,
     /// The label its start carried (IRCv3 labeled-response).
     label: Option<String>,
+    /// Its start said nothing earlier remains (`draft/chathistory-end`).
+    end: bool,
     items: Vec<Item>,
 }
 
@@ -185,6 +194,11 @@ pub struct NetworkState {
     /// Masks whose messages are dropped, casefolded (`nick!user@host`
     /// with `*` and `?`).
     pub ignores: Vec<String>,
+    /// The last channel list asked for (LIST), while it's wanted.
+    pub channels: Option<ChannelList>,
+    /// The message being applied's ID: lines it adds carry it, so history
+    /// that repeats them is recognized (IRCv3 message-ids).
+    message_id: Option<Box<str>>,
 }
 
 impl NetworkState {
@@ -210,6 +224,8 @@ impl NetworkState {
             who_running: None,
             monitored: Vec::new(),
             ignores: Vec::new(),
+            channels: None,
+            message_id: None,
         }
     }
 
@@ -337,7 +353,10 @@ impl NetworkState {
         false
     }
 
-    fn add(&mut self, index: usize, line: Line, applied: &mut Applied) {
+    fn add(&mut self, index: usize, mut line: Line, applied: &mut Applied) {
+        if line.msgid.is_none() {
+            line.msgid.clone_from(&self.message_id);
+        }
         let private = self.buffers[index].kind == BufferKind::Query
             && matches!(line.kind, LineKind::Message | LineKind::Action);
         if !line.own && (line.highlight || private) && !applied.alerts.contains(&index) {
@@ -441,7 +460,11 @@ impl NetworkState {
         if route.is_some() {
             self.route = route;
         }
+        self.message_id = message
+            .tag("msgid")
+            .map(|id| id.into_owned().into_boxed_str());
         self.apply_one(message, now, label.as_deref(), applied);
+        self.message_id = None;
         self.route = saved;
     }
 
@@ -465,6 +488,7 @@ impl NetworkState {
                     params: params.collect(),
                     parent: message.tag("batch").map(Cow::into_owned),
                     label: message.tag("label").map(Cow::into_owned),
+                    end: message.tag("draft/chathistory-end").is_some(),
                     items: Vec::new(),
                 },
             );
@@ -495,6 +519,8 @@ impl NetworkState {
         }
         if matches!(batch.kind.as_str(), "netsplit" | "netjoin") {
             self.collapse(batch, now, applied);
+        } else if batch.kind == "chathistory" {
+            self.history_batch(batch, now, applied);
         } else {
             for item in batch.items {
                 match item {
@@ -562,6 +588,152 @@ impl NetworkState {
             let text = format!("{verb} {servers}: {names}");
             self.event(index, time, prefix, text, applied);
         }
+    }
+
+    /// Earlier messages from the server (IRCv3 chathistory) go in front of
+    /// their buffer as history, without any already shown (by `msgid`) or
+    /// newer than what it has.
+    fn history_batch(&mut self, batch: Batch, now: i64, applied: &mut Applied) {
+        let Some(index) = batch.params.first().and_then(|target| self.find(target)) else {
+            return;
+        };
+        let mut lines: Vec<Line> = batch
+            .items
+            .iter()
+            .filter_map(|item| match item {
+                Item::Message(message) => self.history_line(message, now),
+                Item::Batch(_) => None,
+            })
+            .collect();
+        let buffer = &self.buffers[index];
+        let shown: std::collections::HashSet<&str> = buffer
+            .lines()
+            .iter()
+            .filter_map(|line| line.msgid.as_deref())
+            .collect();
+        let oldest = buffer.oldest_time();
+        lines.retain(|line| {
+            line.msgid.as_deref().is_none_or(|id| !shown.contains(id))
+                && oldest.is_none_or(|oldest| line.time <= oldest)
+        });
+        lines.sort_by_key(|line| line.time);
+        let buffer = &mut self.buffers[index];
+        let added = buffer.prepend(lines);
+        buffer.history.loading = false;
+        if batch.end || added == 0 {
+            buffer.history.server_done = true;
+        }
+        applied.touch(index);
+    }
+
+    /// A message from history as a line, without changing anything:
+    /// messages, actions and notices, and events; CTCP queries are left
+    /// out.
+    fn history_line(&self, message: &Message, now: i64) -> Option<Line> {
+        let notice = message.command().eq_ignore_ascii_case("NOTICE");
+        if !notice && !message.command().eq_ignore_ascii_case("PRIVMSG") {
+            return self.history_event(message, message_time(message, now));
+        }
+        let source = message.source().unwrap_or("");
+        let from = message.nick().unwrap_or("");
+        if !self.is_me(from) && self.ignored(source) {
+            return None;
+        }
+        let target = message.param(0)?;
+        let mut text = message.param(1)?;
+        let mut kind = if notice {
+            LineKind::Notice
+        } else {
+            LineKind::Message
+        };
+        if let Some(ctcp) = text.strip_prefix('\u{1}') {
+            let body = ctcp.strip_suffix('\u{1}').unwrap_or(ctcp);
+            let (verb, args) = body.split_once(' ').unwrap_or((body, ""));
+            if notice || !verb.eq_ignore_ascii_case("ACTION") {
+                return None;
+            }
+            kind = LineKind::Action;
+            text = args;
+        }
+        let own = self.is_me(from);
+        let channel = self.isupport.is_channel(target);
+        let mut line = Line::message(message_time(message, now), kind, from, text);
+        line.own = own;
+        line.highlight = !own && channel && self.mentions(text);
+        line.msgid = message
+            .tag("msgid")
+            .map(|id| id.into_owned().into_boxed_str());
+        line.history = true;
+        Some(line)
+    }
+
+    /// An event from history (IRCv3 event-playback) as a line, worded as
+    /// it showed live and changing nothing. Joins, parts, quits and nick
+    /// changes are quiet, as who spoke around them isn't known.
+    fn history_event(&self, message: &Message, time: i64) -> Option<Line> {
+        let source = message.source().unwrap_or("");
+        let parts = split_source(source);
+        let from = parts.nick;
+        let me = self.is_me(from);
+        if !me && self.ignored(source) {
+            return None;
+        }
+        let params: Vec<&str> = message.params().collect();
+        let param = |index: usize| params.get(index).copied().unwrap_or("");
+        let who = |nick: &str| {
+            if self.is_me(nick) {
+                String::from("You")
+            } else {
+                nick.to_string()
+            }
+        };
+        let (prefix, text, quiet) = match message.command().to_ascii_uppercase().as_str() {
+            "JOIN" if me => ("→", format!("You joined {}", param(0)), false),
+            "JOIN" => {
+                let userhost = match (parts.user, parts.host) {
+                    (Some(user), Some(host)) => format!(" ({user}@{host})"),
+                    _ => String::new(),
+                };
+                ("→", format!("{from}{userhost} joined"), true)
+            }
+            "PART" => {
+                let reason = params
+                    .get(1)
+                    .map(|reason| format!(" ({})", strip(reason)))
+                    .unwrap_or_default();
+                ("←", format!("{} left{reason}", who(from)), !me)
+            }
+            "KICK" => (
+                "←",
+                format!("{from} kicked {} ({})", who(param(1)), strip(param(2))),
+                false,
+            ),
+            "QUIT" => ("←", format!("{from} quit ({})", strip(param(0))), true),
+            "NICK" if me => ("•", format!("You are now known as {}", param(0)), false),
+            "NICK" => ("•", format!("{from} is now known as {}", param(0)), true),
+            "TOPIC" if param(1).is_empty() => ("•", format!("{from} cleared the topic"), false),
+            "TOPIC" => (
+                "•",
+                format!("{from} changed the topic to: {}", strip(param(1))),
+                false,
+            ),
+            "MODE" => (
+                "•",
+                format!(
+                    "{from} sets mode {}",
+                    params.get(1..).unwrap_or_default().join(" ")
+                ),
+                false,
+            ),
+            _ => return None,
+        };
+        let mut line = Line::new(time, LineKind::Event, prefix, text);
+        line.quiet = quiet;
+        line.history = true;
+        line.msgid = message
+            .tag("msgid")
+            .map(|id| id.into_owned().into_boxed_str());
+        Some(line)
     }
 
     /// A new label for a command sent from buffer `index`, while
@@ -918,6 +1090,7 @@ impl NetworkState {
                     time,
                     label,
                     account: message.tag("account").map(Cow::into_owned),
+                    msgid: message.tag("msgid").map(Cow::into_owned),
                 },
                 applied,
             ),
@@ -943,10 +1116,48 @@ impl NetworkState {
             }
             "SETNAME" => self.set_realname(from, param(0), applied),
             "CHGHOST" | "ACK" => {}
+            // IRCv3 read-marker: read up to then, here or by another
+            // client of yours.
+            "MARKREAD" => {
+                let read = param(1)
+                    .strip_prefix("timestamp=")
+                    .and_then(crate::irc::time::parse_server_time);
+                if let (Some(index), Some(read)) = (self.find(param(0)), read) {
+                    let buffer = &mut self.buffers[index];
+                    buffer.read_marker = Some(buffer.read_marker.map_or(read, |old| old.max(read)));
+                    let newest_unread = buffer
+                        .lines()
+                        .iter()
+                        .rev()
+                        .find(|line| {
+                            !line.own
+                                && matches!(
+                                    line.kind,
+                                    LineKind::Message | LineKind::Action | LineKind::Notice
+                                )
+                        })
+                        .map(|line| line.time);
+                    if newest_unread.is_some_and(|newest| newest <= read)
+                        && (buffer.unread > 0 || buffer.highlights > 0)
+                    {
+                        buffer.mark_read();
+                        applied.read.push(index);
+                        applied.touch(index);
+                    }
+                }
+            }
             // IRCv3 standard replies.
             "FAIL" | "WARN" | "NOTE" => {
                 if command == "FAIL" {
                     self.refuse(label, None, applied);
+                    // History that can't be had won't be asked for again.
+                    if param(0).eq_ignore_ascii_case("CHATHISTORY")
+                        && let Some(index) = self.route.filter(|&index| index > 0)
+                    {
+                        let history = &mut self.buffers[index].history;
+                        history.loading = false;
+                        history.server_done = true;
+                    }
                 }
                 let description = strip(params.last().copied().unwrap_or("")).into_owned();
                 let text = match param(0) {
@@ -977,6 +1188,26 @@ impl NetworkState {
             "315" if self.who_running == Some(self.fold(param(1))) => {
                 self.who_running = None;
                 self.next_who(applied);
+            }
+            // The channel list asked for (LIST), as it streams in: the
+            // server may skip RPL_LISTSTART, and RPL_TRYAGAIN ends it
+            // early (Modern IRC, LIST message).
+            "321" | "322" | "323" if self.listing() => {
+                if let Some(list) = &mut self.channels {
+                    match command.as_str() {
+                        "322" => list.add(param(1), param(2).parse().unwrap_or(0), param(3)),
+                        "323" => list.finish(None),
+                        _ => {}
+                    }
+                    applied.channels = true;
+                }
+            }
+            "263" if self.listing() && param(1).eq_ignore_ascii_case("LIST") => {
+                let reason = strip(param(2)).into_owned();
+                if let Some(list) = &mut self.channels {
+                    list.finish(Some(reason));
+                    applied.channels = true;
+                }
             }
             // MONITOR (IRCv3 monitor): who among your queries is online.
             "730" | "731" => self.monitored_status(command == "730", param(1), applied),
@@ -1107,6 +1338,11 @@ impl NetworkState {
             }
             _ => self.server_line(message, now, applied),
         }
+    }
+
+    /// A channel list is on its way.
+    fn listing(&self) -> bool {
+        self.channels.as_ref().is_some_and(|list| list.loading)
     }
 
     fn server_line(&mut self, message: &Message, now: i64, applied: &mut Applied) {
@@ -1459,6 +1695,7 @@ impl NetworkState {
         let mut line = Line::message(time, kind, from, text);
         line.own = own;
         line.highlight = !own && channel && self.mentions(text);
+        line.msgid = incoming.msgid.map(String::into_boxed_str);
         self.add(index, line, applied);
     }
 
@@ -1805,6 +2042,116 @@ mod tests {
             texts(&network, rust).last().unwrap(),
             "alice invited erin to #rust"
         );
+    }
+
+    #[test]
+    fn server_history_goes_in_front_without_repeats() {
+        let (mut network, rust) = with_caps(&["batch", "draft/chathistory", "message-tags"]);
+        apply(&mut network, "@msgid=live1 :alice!a@h PRIVMSG #rust :live");
+        network.buffers[rust].history.loading = true;
+        apply(
+            &mut network,
+            "@draft/chathistory-end :srv BATCH +h chathistory #rust",
+        );
+        for line in [
+            "@batch=h;msgid=old1;time=1970-01-01T00:00:00.100Z :bob!b@h PRIVMSG #rust :old one",
+            "@batch=h;msgid=old2;time=1970-01-01T00:00:00.200Z :ruby!u@h PRIVMSG #rust :\u{1}ACTION waved\u{1}",
+            "@batch=h;msgid=old3;time=1970-01-01T00:00:00.300Z :bob!b@h PRIVMSG #rust :\u{1}VERSION\u{1}",
+            "@batch=h;msgid=live1;time=1970-01-01T00:00:00.900Z :alice!a@h PRIVMSG #rust :live",
+        ] {
+            apply(&mut network, line);
+        }
+        apply(&mut network, ":srv BATCH -h");
+        let buffer = &network.buffers[rust];
+        let lines: Vec<(&str, bool, bool)> = buffer
+            .lines()
+            .iter()
+            .map(|line| (line.text.as_str(), line.history, line.own))
+            .collect();
+        assert_eq!(
+            lines,
+            [
+                ("old one", true, false),
+                ("waved", true, true),
+                ("You joined #rust", false, false),
+                ("live", false, false),
+            ],
+            "older history in front, no CTCP, no repeat of what's shown"
+        );
+        assert!(!buffer.history.loading && buffer.history.server_done);
+    }
+
+    #[test]
+    fn history_events_read_as_they_did_and_change_nothing() {
+        let (mut network, _) = with_caps(&[
+            "batch",
+            "draft/chathistory",
+            "draft/event-playback",
+            "message-tags",
+        ]);
+        // Joining #m6 live; the server's history repeats that join.
+        apply(&mut network, "@msgid=j1 :ruby!u@h JOIN #m6");
+        let m6 = network.find("#m6").unwrap();
+        apply(&mut network, ":srv 353 ruby = #m6 :ruby @alice");
+        apply(&mut network, ":srv 366 ruby #m6 :End");
+        let members = network.buffers[m6].members.len();
+        apply(&mut network, ":srv BATCH +e chathistory #m6");
+        for line in [
+            "@batch=e;msgid=a;time=1970-01-01T00:00:00.100Z :alice!a@h JOIN #m6",
+            "@batch=e;msgid=b;time=1970-01-01T00:00:00.200Z :alice!a@h TOPIC #m6 :\u{2}New\u{2} topic",
+            "@batch=e;msgid=c;time=1970-01-01T00:00:00.300Z :bob!b@h PART #m6 :bye",
+            "@batch=e;msgid=d;time=1970-01-01T00:00:00.400Z :alice!a@h KICK #m6 carol :spam",
+            "@batch=e;msgid=e;time=1970-01-01T00:00:00.500Z :alice!a@h MODE #m6 +o dave",
+            "@batch=e;msgid=f;time=1970-01-01T00:00:00.600Z :dave!d@h QUIT :gone",
+            "@batch=e;msgid=g;time=1970-01-01T00:00:00.700Z :dave!d@h TAGMSG #m6",
+            "@batch=e;msgid=j1;time=1970-01-01T00:00:00.800Z :ruby!u@h JOIN #m6",
+        ] {
+            apply(&mut network, line);
+        }
+        apply(&mut network, ":srv BATCH -e");
+        let buffer = &network.buffers[m6];
+        let lines: Vec<(&str, bool)> = buffer
+            .lines()
+            .iter()
+            .filter(|line| line.history)
+            .map(|line| (line.text.as_str(), line.quiet))
+            .collect();
+        assert_eq!(
+            lines,
+            [
+                ("alice (a@h) joined", true),
+                ("alice changed the topic to: New topic", false),
+                ("bob left (bye)", true),
+                ("alice kicked carol (spam)", false),
+                ("alice sets mode +o dave", false),
+                ("dave quit (gone)", true),
+            ],
+            "worded as live, the repeated join left out"
+        );
+        assert_eq!(buffer.members.len(), members, "members as they were");
+        assert_eq!(buffer.topic, None);
+    }
+
+    #[test]
+    fn read_markers_from_other_clients_clear_unread() {
+        let (mut network, rust) = with_caps(&["draft/read-marker"]);
+        apply(&mut network, ":alice!a@h PRIVMSG #rust :news");
+        assert_eq!(network.buffers[rust].unread, 1);
+        // Read up to an earlier moment: still unread.
+        let applied = apply(
+            &mut network,
+            ":srv MARKREAD #rust timestamp=1970-01-01T00:00:00.500Z",
+        );
+        assert!(applied.read.is_empty());
+        let applied = apply(
+            &mut network,
+            ":srv MARKREAD #rust timestamp=1970-01-01T00:00:01.000Z",
+        );
+        assert_eq!(applied.read, [rust]);
+        assert_eq!(network.buffers[rust].unread, 0);
+        assert_eq!(network.buffers[rust].read_marker, Some(1000));
+        apply(&mut network, ":srv MARKREAD #rust *");
+        assert_eq!(network.buffers[rust].read_marker, Some(1000));
     }
 
     #[test]

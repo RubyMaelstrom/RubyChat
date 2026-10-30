@@ -1,11 +1,13 @@
 //! What the interface shows: networks of buffers of lines (DESIGN.md §7).
 
 pub mod buffer;
+pub mod channels;
 pub mod editor;
 pub mod links;
 pub mod members;
 pub mod network;
 pub mod recent;
+pub mod search;
 
 use std::borrow::Cow;
 
@@ -55,6 +57,12 @@ pub struct Line {
     /// A join, part, quit or nick change of someone who hadn't spoken
     /// lately, which the smart filter hides.
     pub quiet: bool,
+    /// From history (a log or the server's), not seen live: never unread,
+    /// never logged again.
+    pub history: bool,
+    /// The server's ID for it (IRCv3 message-ids), for spotting history
+    /// already shown.
+    pub msgid: Option<Box<str>>,
     /// Its buffer's serial number for it (0 until added to a buffer).
     pub id: u64,
 }
@@ -77,6 +85,8 @@ impl Line {
             pending: false,
             failed: false,
             quiet: false,
+            history: false,
+            msgid: None,
             id: 0,
         }
     }

@@ -4,15 +4,20 @@
 //! one. Missing directories are created with mode 0700 and existing ones
 //! keep their permissions (XDG Base Directory Specification, "Referencing
 //! this specification"). Secrets are written readable by their owner alone,
-//! and saves queued for the same file collapse into the newest.
+//! and saves queued for the same file collapse into the newest. Chat logs
+//! (`log`) are appended here too, flushed a second after the first line
+//! not yet written and on exit, and read back for backlog.
 
 use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
 
 use crate::platform::paths;
+
+pub mod log;
 
 /// A file RubyChat keeps (DESIGN.md §11).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -52,7 +57,21 @@ impl Document {
 enum Command {
     Load(Document),
     Save(Document, String),
+    Log(log::LogLine),
+    Backlog(BacklogRequest),
     Shutdown,
+}
+
+/// Lines from a buffer's logs, for its backlog.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BacklogRequest {
+    /// Matches the answer to the question.
+    pub id: u64,
+    pub network: String,
+    pub buffer: String,
+    /// Only lines from before this time; all when `None`.
+    pub before: Option<i64>,
+    pub limit: usize,
 }
 
 #[derive(Debug)]
@@ -60,7 +79,12 @@ pub enum StoreEvent {
     /// The document's text; `None` if it doesn't exist yet.
     Loaded(Document, Result<Option<String>, String>),
     Saved(Document, Result<(), String>),
+    /// A backlog request's lines, oldest first.
+    Backlog(u64, Result<Vec<crate::model::Line>, String>),
 }
+
+/// How long a logged line may wait before it is written to disk.
+const LOG_FLUSH: Duration = Duration::from_secs(1);
 
 pub struct Store {
     commands: mpsc::Sender<Command>,
@@ -77,11 +101,39 @@ impl Store {
         let thread = std::thread::Builder::new()
             .name(String::from("rubychat-store"))
             .spawn(move || {
+                let logs_root = paths::data_dir().map(|dir| dir.join("logs"));
+                let mut logs = logs_root.clone().map(log::Writer::new);
+                // When logged lines must be on disk; none while all are.
+                let mut flush_at: Option<Instant> = None;
+                let flush = |logs: &mut Option<log::Writer>| {
+                    if let Some(writer) = logs
+                        && let Err(error) = writer.flush()
+                    {
+                        eprintln!("rubychat: writing chat logs: {error}");
+                    }
+                };
                 // Commands run in order, so a save always follows the load
                 // before it, and shutdown waits for pending writes. A save
                 // that a newer one of the same file follows, with no load
                 // between them, is skipped.
-                while let Ok(first) = receiver.recv() {
+                loop {
+                    let first = match flush_at {
+                        Some(at) => match receiver
+                            .recv_timeout(at.saturating_duration_since(Instant::now()))
+                        {
+                            Ok(command) => command,
+                            Err(mpsc::RecvTimeoutError::Timeout) => {
+                                flush(&mut logs);
+                                flush_at = None;
+                                continue;
+                            }
+                            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                        },
+                        None => match receiver.recv() {
+                            Ok(command) => command,
+                            Err(_) => break,
+                        },
+                    };
                     let mut batch = vec![first];
                     batch.extend(receiver.try_iter());
                     let skip: Vec<bool> = (0..batch.len())
@@ -96,10 +148,39 @@ impl Store {
                             Command::Save(document, text) => {
                                 sink(StoreEvent::Saved(document, save(document, &text)))
                             }
-                            Command::Shutdown => return,
+                            Command::Log(line) => {
+                                if let Some(writer) = &mut logs
+                                    && writer.append(&line).is_ok()
+                                    && flush_at.is_none()
+                                {
+                                    flush_at = Some(Instant::now() + LOG_FLUSH);
+                                }
+                            }
+                            Command::Backlog(request) => {
+                                // What was just logged counts.
+                                flush(&mut logs);
+                                flush_at = None;
+                                let lines = match &logs_root {
+                                    Some(root) => log::backlog(
+                                        root,
+                                        &request.network,
+                                        &request.buffer,
+                                        request.before,
+                                        request.limit,
+                                    )
+                                    .map_err(|error| format!("reading chat logs: {error}")),
+                                    None => Ok(Vec::new()),
+                                };
+                                sink(StoreEvent::Backlog(request.id, lines));
+                            }
+                            Command::Shutdown => {
+                                flush(&mut logs);
+                                return;
+                            }
                         }
                     }
                 }
+                flush(&mut logs);
             })?;
         Ok(Self {
             commands,
@@ -113,6 +194,16 @@ impl Store {
 
     pub fn save(&self, document: Document, text: String) {
         let _ = self.commands.send(Command::Save(document, text));
+    }
+
+    /// Appends a line to its buffer's log.
+    pub fn log(&self, line: log::LogLine) {
+        let _ = self.commands.send(Command::Log(line));
+    }
+
+    /// Asks for lines from a buffer's logs; `StoreEvent::Backlog` answers.
+    pub fn backlog(&self, request: BacklogRequest) {
+        let _ = self.commands.send(Command::Backlog(request));
     }
 }
 

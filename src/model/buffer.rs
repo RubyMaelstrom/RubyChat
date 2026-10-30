@@ -8,9 +8,28 @@ use super::editor::LineEditor;
 use super::members::Members;
 use super::{Line, LineKind};
 
-/// Lines kept per buffer (DESIGN.md §7).
+/// Lines kept per buffer (DESIGN.md §7); history put in front may double
+/// them while it is read.
 pub const SERVER_LINES: usize = 2000;
 pub const CONVERSATION_LINES: usize = 5000;
+/// Serial numbers of live lines start here, leaving room below for history
+/// put in front: serial numbers stay consecutive.
+pub const FIRST_ID: u64 = 1 << 32;
+
+/// A buffer's earlier lines: where they come from and what's left.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct History {
+    /// Some have been asked for, or will be once the network registers.
+    pub requested: bool,
+    /// Waiting to know whether the server keeps history.
+    pub deferred: bool,
+    /// A request is on its way.
+    pub loading: bool,
+    /// The server's history (CHATHISTORY) has nothing earlier.
+    pub server_done: bool,
+    /// The logs have nothing earlier.
+    pub logs_done: bool,
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BufferKind {
@@ -90,6 +109,12 @@ pub struct Buffer {
     pub label_chars: usize,
     /// A query's person.
     pub peer: Peer,
+    pub history: History,
+    /// The last line considered for the log.
+    pub logged: u64,
+    /// The newest time known read, here or by another client
+    /// (IRCv3 read-marker).
+    pub read_marker: Option<i64>,
 }
 
 impl Buffer {
@@ -104,7 +129,7 @@ impl Buffer {
             } else {
                 CONVERSATION_LINES
             },
-            next_id: 1,
+            next_id: FIRST_ID,
             topic: None,
             topic_by: None,
             modes: Vec::new(),
@@ -121,6 +146,9 @@ impl Buffer {
             marker: None,
             label_chars: 0,
             peer: Peer::default(),
+            history: History::default(),
+            logged: FIRST_ID - 1,
+            read_marker: None,
         }
     }
 
@@ -148,10 +176,43 @@ impl Buffer {
             self.activity = self.activity.max(Activity::Events);
         }
         self.label_chars = self.label_chars.max(line.label_chars());
-        if self.lines.len() == self.capacity {
+        // One out for one in: history read past the capacity stays while
+        // it's read.
+        if self.lines.len() >= self.capacity {
             self.lines.pop_front();
         }
         self.lines.push_back(line);
+    }
+
+    /// Puts earlier lines in front, as history, up to twice the capacity
+    /// in all; how many went in (the newest of `lines` first).
+    pub fn prepend(&mut self, lines: Vec<Line>) -> usize {
+        let room = (self.capacity * 2).saturating_sub(self.lines.len());
+        let mut id = self.lines.front().map_or(self.next_id, |line| line.id);
+        let mut added = 0;
+        for mut line in lines.into_iter().rev().take(room) {
+            id -= 1;
+            line.id = id;
+            line.history = true;
+            self.label_chars = self.label_chars.max(line.label_chars());
+            self.lines.push_front(line);
+            added += 1;
+        }
+        added
+    }
+
+    /// The time of the oldest line, which earlier history goes before.
+    pub fn oldest_time(&self) -> Option<i64> {
+        self.lines.front().map(|line| line.time)
+    }
+
+    /// The newest line's time, for telling the server what was read.
+    pub fn newest_time(&self) -> Option<i64> {
+        self.lines
+            .iter()
+            .rev()
+            .find(|line| !line.pending)
+            .map(|line| line.time)
     }
 
     pub fn lines(&self) -> &VecDeque<Line> {
@@ -241,7 +302,7 @@ mod tests {
             (channel.unread, channel.highlights, channel.activity),
             (2, 1, Activity::Highlight)
         );
-        assert_eq!(channel.marker, Some(2));
+        assert_eq!(channel.marker, Some(FIRST_ID + 1));
         let mut own = message("mine", false);
         own.own = true;
         channel.push(own);
@@ -253,7 +314,7 @@ mod tests {
         );
         assert_eq!(
             channel.marker,
-            Some(2),
+            Some(FIRST_ID + 1),
             "the rule stays while the buffer is shown"
         );
         channel.push(message("seen at once", true));
@@ -276,16 +337,40 @@ mod tests {
         for n in 0..5 {
             server.push(Line::new(0, LineKind::Server, "", format!("{n}")));
         }
-        assert_eq!(server.lines().front().unwrap().id, 3);
+        let id = |n: u64| FIRST_ID - 1 + n;
+        assert_eq!(server.lines().front().unwrap().id, id(3));
         assert_eq!(
             (
-                server.index_of(2),
-                server.index_of(3),
-                server.index_of(5),
-                server.index_of(6)
+                server.index_of(id(2)),
+                server.index_of(id(3)),
+                server.index_of(id(5)),
+                server.index_of(id(6))
             ),
             (None, Some(0), Some(2), None)
         );
+    }
+
+    #[test]
+    fn history_goes_in_front_with_serial_numbers_to_match() {
+        let mut channel = Buffer::new(BufferKind::Channel, "#rust", "#rust");
+        channel.capacity = 3;
+        channel.push(message("live", false));
+        let first = channel.lines().front().unwrap().id;
+        let older = (0..10)
+            .map(|n| Line::message(n, LineKind::Message, "alice", format!("old {n}")))
+            .collect();
+        // Twice the capacity in all: the newest five of the ten go in.
+        assert_eq!(channel.prepend(older), 5);
+        let lines = channel.lines();
+        assert_eq!(lines.front().unwrap().text, "old 5");
+        assert!(lines.iter().take(5).all(|line| line.history));
+        assert_eq!(channel.index_of(first), Some(5));
+        assert_eq!(channel.index_of(first - 5), Some(0));
+        assert_eq!(channel.unread, 1, "history is never unread");
+        // A live line takes one out, keeping what's read.
+        channel.push(message("newer", false));
+        assert_eq!(channel.lines().len(), 6);
+        assert_eq!(channel.lines().front().unwrap().text, "old 6");
     }
 
     #[test]

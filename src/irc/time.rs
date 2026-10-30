@@ -4,6 +4,21 @@
 use crate::platform::time::days_from_civil;
 
 /// Milliseconds since the Unix epoch, or `None` if `value` is malformed.
+/// `unix_ms` as server-time writes it: `YYYY-MM-DDThh:mm:ss.sssZ`.
+pub fn format_server_time(unix_ms: i64) -> String {
+    let utc = crate::platform::time::utc(unix_ms);
+    format!(
+        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}.{:03}Z",
+        utc.year,
+        utc.month,
+        utc.day,
+        utc.hour,
+        utc.minute,
+        utc.second,
+        unix_ms.rem_euclid(1000)
+    )
+}
+
 pub fn parse_server_time(value: &str) -> Option<i64> {
     let bytes = value.as_bytes();
     if bytes.len() < 20

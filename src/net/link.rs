@@ -55,6 +55,9 @@ const WANTED_CAPS: &[&str] = &[
     "labeled-response",
     "setname",
     "standard-replies",
+    "draft/chathistory",
+    "draft/event-playback",
+    "draft/read-marker",
 ];
 
 /// How a session logs in beyond the server password (DESIGN.md §6.5).

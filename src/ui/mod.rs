@@ -5,6 +5,7 @@
 pub mod branding;
 #[cfg(test)]
 mod budgets;
+pub mod channel_list;
 pub mod chat_view;
 pub mod colors;
 pub mod context_menu;

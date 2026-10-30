@@ -12,11 +12,13 @@ PLAIN, SCRAM-SHA-256 and EXTERNAL, NickServ, certificate policies, pins and
 the trust prompt, client certificates, session restore) and M4 (the
 hand-built D-Bus client, the StatusNotifierItem tray and its dbusmenu,
 notifications, closing to the tray, xdg-activation, single instance and
-`irc://` hand-over, the desktop file and icons) and M5 (batches,
+`irc://` hand-over, the desktop file and icons), M5 (batches,
 echo-message, labeled-response, away and account state, WHOX, MONITOR,
-standard replies, STS, the smart filter, ignores) are implemented on Linux;
-DESIGN.md §16 lists what each left for later. M6 (history and search) is
-next. DESIGN.md §17 records the settled decisions.
+standard replies, STS, the smart filter, ignores) and M6 (chat logs,
+backlog paging, chathistory with event playback, read markers, search, the
+channel list) are implemented on Linux; DESIGN.md §16 lists what each left
+for later. M7 (polish) is next. DESIGN.md §17 records the settled
+decisions.
 
 ## Binding rules
 
@@ -70,16 +72,18 @@ the user's explicit approval.
 ## Diagnostics
 
 - `RUBYCHAT_TRACE=1` logs every frame's paint and present times, its damage
-  and buffer age, and every event-loop wake. An idle window logs nothing.
+  and buffer age, every event-loop wake and focus change. An idle window
+  logs nothing.
 - `RUBYCHAT_EXIT_AFTER=SECONDS` quits cleanly (QUIT to every server) after
   that long; `RUBYCHAT_SNAPSHOT=FILE.png` saves the window's last frame on
   exit. Together they check the real window without screenshots, for
   example `RUBYCHAT_EXIT_AFTER=9 RUBYCHAT_SNAPSHOT=scratch/shot.png
   target/release/rubychat irc.libera.chat` (`scratch/` is ignored by git).
-- RubyChat now keeps a session and pins: runs that connect anywhere should
-  use throwaway directories, so the user's next start isn't changed, for
-  example `XDG_CONFIG_HOME=$PWD/scratch/xdg/config
-  XDG_STATE_HOME=$PWD/scratch/xdg/state target/release/rubychat …`. A
+- RubyChat keeps a session, pins and chat logs: runs that connect anywhere
+  should use throwaway directories, so the user's next start and logs
+  aren't changed, for example `XDG_CONFIG_HOME=$PWD/scratch/xdg/config
+  XDG_STATE_HOME=$PWD/scratch/xdg/state XDG_DATA_HOME=$PWD/scratch/xdg/data
+  target/release/rubychat …`. A
   `networks.toml` there tries saved networks, logins included. The single
   instance is keyed by the executable and configuration directory, so such
   a run never hands over to the user's own RubyChat (and a second launch
@@ -104,15 +108,17 @@ the user's explicit approval.
   bouncer checks. A saved network's `commands` script what RubyChat sends,
   and a small client with SASL plays the other side.
 - `RUBYCHAT_SNAPSHOTS=DIR cargo test --lib snapshots -- --ignored` writes the
-  tab strip, window, context menu, Server Manager, trust prompt and tray
-  icon snapshots; `tab-strip-parity.png` uses trust-desktop's preview titles for
-  side-by-side comparison.
+  tab strip, window, context menu, Server Manager, trust prompt, tray
+  icon, channel list and search snapshots; `tab-strip-parity.png` uses
+  trust-desktop's preview titles for side-by-side comparison.
 - `--demo` opens placeholder networks with channels, members, formatting,
   links, highlights and unread badges: the whole M2 window without
   connecting. `rubychat 'ircs://irc.libera.chat/##rubychat-test'` connects
   and joins a channel (IRC URLs, DESIGN.md §17).
 - `cargo test --release --lib paint_budgets -- --ignored --nocapture` checks
-  the §10 frame budgets at 2560 × 1440.
+  the §10 frame budgets at 2560 × 1440, and a search that finds nothing;
+  `list_budgets` checks a 100,000-channel LIST (M6's check): replies
+  applied, the filtering and sorting slices, and the table repainted.
 - `RUBYCHAT_CHECK_CLIPBOARD=1` pastes the clipboard's text into the input,
   then copies a check string, once the window has the keyboard. With
   `wl-copy` before and `wl-paste` while it runs, it checks both directions;

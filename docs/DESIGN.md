@@ -1,6 +1,6 @@
 # RubyChat design
 
-Draft 2 · 31 October 2026 · decisions settled (§17); milestones M0 to M5
+Draft 2 · 31 October 2026 · decisions settled (§17); milestones M0 to M6
 are implemented (§16).
 
 RubyChat is a desktop IRC client written in Rust. Its overriding goal is that
@@ -234,6 +234,9 @@ Requested when offered: `account-notify`, `account-tag`, `away-notify`,
 M6, `draft/chathistory`, `draft/event-playback`, `draft/read-marker` and
 `draft/multiline`. As built, `sts` is read but never requested, as its
 specification requires; the link tells the UI which capabilities are on.
+Since M6 the three history capabilities are requested; `draft/multiline`
+waits for the multi-line input bar, as without it the server sends each
+line on its own.
 
 ISUPPORT tokens used: `CASEMAPPING`, `CHANMODES`, `CHANTYPES`, `PREFIX`,
 `STATUSMSG`, `TARGMAX`, `NICKLEN`, `TOPICLEN`, `NETWORK`, `MONITOR`, `WHOX`,
@@ -321,6 +324,23 @@ As built in M5:
   invitations from masks per network (a bare nick means `nick!*@*`), kept
   in `networks.toml` for saved networks and in the session for others.
 
+As built in M6:
+
+- A `chathistory` batch goes in front of its buffer: messages, actions and
+  notices, and with `draft/event-playback` joins, parts, kicks, quits,
+  nick changes, topics and modes, worded as they show live and changing no
+  state. Replayed joins, parts, quits and nick changes are quiet for the
+  smart filter, as who spoke around them isn't known. Only lines older
+  than the oldest shown are taken, without any whose `msgid` already shows;
+  every line a message adds carries its `msgid`, events included, so a
+  replay of your own join is recognized.
+- `MARKREAD` from the server moves a buffer's read marker forward and
+  clears its unread counts when it covers the newest unread message.
+- While a channel list is asked for, `RPL_LISTSTART`, `RPL_LIST` and
+  `RPL_LISTEND` fill it rather than the server buffer, and `RPL_TRYAGAIN`
+  for `LIST` ends it with the server's reason (Modern IRC, LIST message).
+- `/list [channels or conditions]` and `/search [text]` join the commands.
+
 ## 7. Data model and memory
 
 - IDs: `NetworkId`, `BufferId`, and a per-buffer monotonic `LineId`.
@@ -338,6 +358,13 @@ As built in M5:
 - Nicks are interned per network.
 - Each buffer tracks message and highlight counts, an activity level, and its
   last-read position (synchronized with `draft/read-marker` when offered).
+  As built: the server hears that a buffer was read up to its newest line
+  when it stops being seen, at exit, and at most every 30 seconds while
+  lines arrive in the buffer you're looking at; queries ask for their
+  marker after registration, as channels get theirs on joining.
+- As built: live lines are numbered from 2³² up, leaving room below for
+  history put in front with consecutive numbers. History may fill a buffer
+  to twice its cap while it's read; new lines then push the oldest out.
 - Other caps: 200 history entries per input, a layout cache by line count,
   and the glyph and emoji caches by bytes (32 MiB and 16 MiB by default).
 
@@ -552,6 +579,28 @@ quit and part messages.
 - Settings: faces and sizes, timestamps, filters, highlight words and
   ignores, notifications, tray, logging, link handlers.
 
+As built in M6:
+
+- Search turns the input row into a find field for the buffer shown
+  (`FIND›`; the draft is kept). Matching ignores case and reads lines as
+  they show: without formatting codes, and an action led by its nick.
+  Every occurrence in view is highlighted in amber, the current one solid.
+  Typing finds the nearest match to the current one, or to the view's
+  bottom line, among the lines loaded; Enter and Up go to earlier matches,
+  Shift+Enter and Down to later ones. Past the oldest line Enter asks for
+  earlier history, from the server or the logs, and searches on as it
+  arrives, as far as the buffer holds (twice its scrollback); the field
+  says when there are no more matches. Switching buffers searches the new
+  one.
+- The channel list (`/list`) takes the chat view's place, and the nick
+  list's, on the network shown: a table of name, users and topic under
+  column titles that sort by them, users first by default. Channels show as
+  they stream in; the input row filters by name or topic (`FILTER›`); Up,
+  Down, Page Up and Page Down select, Enter or a double click joins and
+  shows the channel, Tab sorts the other way, and Esc closes it. The header
+  counts channels and says when the list is loading or sorting. At most
+  200,000 channels are kept; more are counted.
+
 ### 8.11 Keyboard
 
 | Keys | Action |
@@ -661,6 +710,14 @@ machine at 2560 × 1440, scale 1, and benchmarks check them (§14).
 | Idle | No UI wakeups | No timers without a visible reason |
 | Launch to first frame | 100 ms | Connections, backlog and fallback fonts start after the first frame |
 
+As built in M6: the channel list filters and sorts in slices of at most
+3 ms that share the wake's 4 ms with draining network events; a slice
+waits for the next wake while typing repaints the input row, so the
+keystroke shows first. A 100,000-channel list applies its replies at
+0.5 µs each, settles in slices no longer than 3.1 ms and repaints its
+table in 1.7 ms (`list_budgets`). A search keystroke that finds nothing in
+5,000 lines takes 0.5 ms (`paint_budgets`).
+
 The interface is optimistic: `/join` opens the buffer at once in a joining
 state, `/query` opens immediately, `/part` closes immediately, and a nick
 change shows as pending until the server confirms it.
@@ -698,6 +755,19 @@ as they're measured.
   buffer's last lines load from its log the first time it's shown.
 - As built (M5): STS policies live in `sts.toml` (host, port, duration and
   expiry), and ignore masks in each network's `ignore` list.
+- As built (M6): logs are written by the store thread, a day file per UTC
+  date, with the kind's flags (`msg,own,hl`) and the `msgid` after the
+  text; the network's directory is its title and the buffer's its
+  casefolded name, both percent-encoded where a file name can't hold them.
+  Messages, actions, notices and events are logged once settled (not while
+  waiting for their echo), and not history from the server, failed sends,
+  the server buffer or RubyChat's own notes: the server keeps its history,
+  and the logs what this RubyChat saw. At most 16 files stay open. A
+  buffer's earlier lines come from the server's history while it has any
+  (IRCv3 chathistory), then from the logs, 100 and 200 lines at a time; a
+  buffer shown while its network connects waits for registration to learn
+  which. Reading the logs runs on the store thread, newest day first, from
+  each file's end.
 - As built: the session keeps networks that are connected or reconnecting,
   with the channels they are in or joining, their queries, the buffer each
   shows and the network shown. It is saved as it changes, with queued saves
@@ -917,6 +987,14 @@ the primary selection (middle click) is not supported.
   lost connections, labeled routing of WHOIS, `ACK` and `FAIL`, away and
   account state through WHOX, MONITOR, the smart filter, ignores, STS in
   the link and the app, and labeled sends from the input.
+- Since M6: the log format round trip, file names and reading back across
+  day files; history batches with de-duplication and replayed events;
+  read markers both ways; history asked for when a buffer first shows,
+  deferred until registration, and paged from the logs; search through
+  lines and into history; matches highlighted (by pixel); the channel list
+  streaming, filtering, sorting and joining, slice sorts against the
+  standard library's, and the table's hit testing. `list_budgets` checks a
+  100,000-channel LIST; `list_and_find_snapshots` draws both surfaces.
 - Before handoff: `cargo fmt --check`, `cargo clippy --all-targets`,
   `cargo test`, `cargo test --release`, `cargo build --release`.
 - By hand: Libera.Chat and OFTC over TLS; a local ergo for self-signed
@@ -934,20 +1012,23 @@ assets/
 src/
   main.rs         startup, single-instance handoff, event loop
   lib.rs
-  app/            app state, ApplicationHandler, window lifecycle, commands, key map
+  app/            app state, ApplicationHandler, window lifecycle, commands, key map,
+                  history, find, channels
   irc/            message, tags, casemap, isupport, cap, sasl/, ctcp, format, modes,
                   numerics, split
   net/            reactor, connect (Happy Eyeballs), tls (verifiers, pins), session,
                   flood, resolve, socks
-  model/          network, buffer, line, members, highlight, ignore, input history, unread
+  model/          network, buffer, line, members, highlight, ignore, input history, unread,
+                  search, channels
   ui/             theme, layout, tab_strip, sidebar, header, chat_view, nick_list, input,
-                  context_menu, colors, server_manager, switcher, dialog, widgets
+                  context_menu, colors, server_manager, switcher, dialog, widgets,
+                  channel_list
   render/         canvas, damage, raster, paint, glyph_cache, text (shape, wrap, bidi),
                   fonts, emoji, present, snapshot (PNG writer)
   platform/       paths, time, open, clipboard, activation, instance, dbus/, desktop/
                   (the desktop thread: service, tray, notify)
   config/         TOML subset, settings, networks, secrets, session
-  store/          log writer and reader, backlog paging, search
+  store/          log writer and reader, backlog paging
 tests/            scenario tests; fixtures (parser-tests vectors, test certificates)
 ```
 
@@ -990,6 +1071,19 @@ window closed, RubyChat wakes nothing; the paint budgets are unchanged.
 Still 89 crates. Not yet: the Windows tray, notifications and named pipe
 (they come with the Windows build, M7), muting a buffer, showing the icon
 only while the window is closed, and installing the desktop file.
+
+M6's scope is implemented and tested. On the local ergo, a channel's
+history came back on joining with its topic change and an earlier join as
+event lines (event playback), and search highlighted matches among them;
+`/list` listed ergo's channels. Against a scripted server, a 100,000-channel
+LIST streamed in, in 0.3 seconds, sorted by users with frames painted in
+under 3 ms (the first frame aside), and the window went idle once it
+settled; the server heard `MARKREAD` once lines arrived in the buffer
+shown; and with no history offered, a channel showed the lines its logs
+kept from earlier runs. Not yet: logging lines from the server's history,
+searching across buffers or further back than a buffer holds,
+`draft/multiline`, and channel list conditions offered as controls rather
+than typed (`/list >50`).
 
 M5's scope is implemented and tested, and checked on a local ergo 2.19.1
 (the official release, checksum-verified): a plaintext address upgraded to
@@ -1086,6 +1180,21 @@ Settled while building M5:
     and the UI, which owns the pins, makes the secure reconnection.
 25. **Ignores are per network**, and WHO after joining asks only about
     channels up to 1,000 members, one at a time.
+
+Settled while building M6:
+
+26. **The logs keep what this RubyChat saw**: history from the server
+    isn't logged, so the logs never repeat or reorder a bouncer's.
+27. **History comes from the server first** while it has any, then from
+    the logs; a buffer shown while connecting waits to learn which.
+28. **Search and the channel list use the input row** rather than fields
+    of their own, and search reaches as far back as a buffer holds.
+29. **Read markers are sent on looking away and at exit**, and at most
+    every 30 seconds while lines arrive in the buffer you're looking at.
+30. **Event playback is asked for**, so history shows joins and topics as
+    RubyChat words them rather than as a server's notices about them.
+31. **The channel list sorts by users first**; sorting by name waits for
+    the list to be complete, and its order is kept for later filtering.
 
 ## 18. Standards
 

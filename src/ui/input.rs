@@ -4,7 +4,7 @@
 pub use crate::model::editor::LineEditor;
 use crate::render::{Align, Color, Painter, Rect, TextStyle};
 
-use super::theme::{self, CYAN, DIM, DISABLED, EDGE, INSET, TEXT};
+use super::theme::{self, AMBER, CYAN, DIM, DISABLED, EDGE, INSET, TEXT};
 
 /// The input field's text style: the chat face.
 pub fn input_style() -> TextStyle {
@@ -13,7 +13,8 @@ pub fn input_style() -> TextStyle {
 
 /// Paints COMMAND's input field in `rect`: inset surface, etched edge, cyan
 /// left edge and prompt, the text scrolled to keep the caret in view, and a
-/// steady caret (no blinking, so an idle window never wakes).
+/// steady caret (no blinking, so an idle window never wakes). A `note`
+/// (search's NO MATCHES) sits at the right end.
 pub fn paint_input(
     painter: &mut Painter<'_>,
     rect: Rect,
@@ -21,6 +22,7 @@ pub fn paint_input(
     prompt: &str,
     placeholder: &str,
     focused: bool,
+    note: Option<&str>,
 ) {
     painter.fill_rect(rect, INSET);
     painter.stroke_rect(rect, 1.0, EDGE);
@@ -37,10 +39,26 @@ pub fn paint_input(
         CYAN,
         Align::Start,
     );
+    let note_style = theme::chrome(9.0);
+    let note_width = note.map_or(0.0, |note| painter.text.width(note, &note_style) + 16.0);
+    if let Some(note) = note {
+        painter.label(
+            note,
+            Rect::new(
+                rect.right() - note_width,
+                rect.y,
+                note_width - 12.0,
+                rect.height,
+            ),
+            &note_style,
+            AMBER,
+            Align::End,
+        );
+    }
     let field = Rect::new(
         rect.x + 22.0 + prompt_width,
         rect.y,
-        (rect.width - prompt_width - 34.0).max(0.0),
+        (rect.width - prompt_width - 34.0 - note_width).max(0.0),
         rect.height,
     );
     let style = input_style();

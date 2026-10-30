@@ -25,6 +25,9 @@ pub struct Isupport {
     pub monitor: Option<usize>,
     /// WHO takes WHOX's `%fields` (IRCv3 whox).
     pub whox: bool,
+    /// The most messages one CHATHISTORY request may ask for; `Some(0)` for
+    /// no limit (IRCv3 chathistory).
+    pub chathistory: Option<usize>,
 }
 
 impl Default for Isupport {
@@ -45,6 +48,7 @@ impl Default for Isupport {
             topiclen: None,
             monitor: None,
             whox: false,
+            chathistory: None,
         }
     }
 }
@@ -75,6 +79,7 @@ impl Isupport {
                     "TOPICLEN" => self.topiclen = None,
                     "MONITOR" => self.monitor = None,
                     "WHOX" => self.whox = false,
+                    "CHATHISTORY" => self.chathistory = None,
                     _ => {}
                 }
                 continue;
@@ -101,6 +106,7 @@ impl Isupport {
                 "MONITOR" => self.monitor = Some(value.parse().unwrap_or(usize::MAX)),
                 // "Clients MUST accept WHOX tokens with a value."
                 "WHOX" => self.whox = true,
+                "CHATHISTORY" => self.chathistory = Some(value.parse().unwrap_or(0)),
                 _ => {}
             }
         }

@@ -19,6 +19,18 @@ pub fn state_dir() -> Option<PathBuf> {
     }
 }
 
+/// `$XDG_DATA_HOME/rubychat`: chat logs.
+pub fn data_dir() -> Option<PathBuf> {
+    #[cfg(windows)]
+    {
+        windows_dir("LOCALAPPDATA")
+    }
+    #[cfg(not(windows))]
+    {
+        xdg_dir("XDG_DATA_HOME", ".local/share")
+    }
+}
+
 /// `$XDG_CONFIG_HOME/rubychat`: settings and saved networks.
 pub fn config_dir() -> Option<PathBuf> {
     #[cfg(windows)]

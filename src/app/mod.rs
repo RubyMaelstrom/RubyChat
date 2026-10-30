@@ -7,9 +7,12 @@
 //! Each region repaints only when it changed: a keystroke repaints the input
 //! field and nothing else.
 
+mod channels;
 mod chrome;
 mod commands;
 mod demo;
+mod find;
+mod history;
 mod manager;
 mod menus;
 mod present;
@@ -36,6 +39,7 @@ use winit::window::{CursorIcon, Window, WindowId};
 
 use crate::irc::Message;
 use crate::model::buffer::{Buffer, BufferKind};
+use crate::model::channels::Order;
 use crate::model::members::Member;
 use crate::model::network::{Applied, NetworkState};
 use crate::model::recent::{Recent, RecentServer};
@@ -49,7 +53,8 @@ use crate::platform::time::now_ms;
 use crate::render::{Canvas, Damage, Painter, Point, Rect, TextSystem};
 use crate::store::{Document, Store, StoreEvent};
 use crate::ui::branding::Logo;
-use crate::ui::chat_view::{self, ChatContext, ChatFrame, ChatView, Target, TextPosition};
+use crate::ui::channel_list::{self, TableLayout, TableView};
+use crate::ui::chat_view::{self, ChatContext, ChatFrame, ChatView, Found, Target, TextPosition};
 use crate::ui::header::{self, HEADER_HEIGHT, HeaderView, thousands};
 use crate::ui::input::{LineEditor, paint_input};
 use crate::ui::nick_list::{self, NICK_LIST_WIDTH};
@@ -155,9 +160,10 @@ pub fn run(options: Options) -> Result<(), String> {
     };
     let mut app = App::new(options, waker)?;
     event_loop.run_app(&mut app).map_err(|e| e.to_string())?;
-    // What was open, for next time, while it still is.
+    // What was open, for next time, while it still is, and what was read.
     app.session_changed();
     app.save_session();
+    app.read_on_exit();
     // Dropping the handles says QUIT to every server, finishes pending
     // writes and withdraws notifications.
     drop(app.net.take());
@@ -255,6 +261,14 @@ impl Network {
         matches!(self.status, LinkStatus::Registered { .. })
     }
 
+    /// On its way to registering: what the server offers isn't known yet.
+    fn registering(&self) -> bool {
+        matches!(
+            self.status,
+            LinkStatus::Resolving | LinkStatus::Connecting | LinkStatus::Registering
+        )
+    }
+
     /// The sidebar's status line.
     fn status_line(&self) -> Status {
         // Encryption without a verified identity is shown as such
@@ -348,6 +362,12 @@ pub struct App {
     instance_inbox: Inbox<Request>,
     /// The tray, notifications and the window's comings and goings.
     shell: shell::Shell,
+    /// Backlog requests to the store awaiting lines: their ID, network and
+    /// buffer.
+    backlogs: std::collections::VecDeque<(u64, NetworkId, String)>,
+    next_backlog: u64,
+    /// When the server last heard what was read in the buffer in view.
+    read_sent: Option<Instant>,
     /// Inbox events wait to be drained after this wake's input.
     inbox_ready: bool,
     /// Wakes the event loop to drain what one wake's budget left.
@@ -369,6 +389,10 @@ pub struct App {
     /// Hide joins, parts, quits and nick changes of people who haven't
     /// spoken lately (DESIGN.md §8.6); `/filter` toggles it.
     smart_filter: bool,
+    /// Ctrl+F's find field, while open.
+    find: Option<find::Find>,
+    /// The channel list (`/list`), while it shows.
+    browser: Option<channels::Browser>,
     sidebar_scroll: f32,
     hover: Hover,
     /// What the chat view last showed, for finding what's under the pointer.
@@ -533,6 +557,9 @@ impl App {
             desktop_inbox,
             instance_inbox,
             shell,
+            backlogs: Default::default(),
+            next_backlog: 0,
+            read_sent: None,
             inbox_ready: false,
             wake: waker(),
             #[cfg(test)]
@@ -546,6 +573,8 @@ impl App {
             show_sidebar: true,
             show_nicks: true,
             smart_filter: true,
+            find: None,
+            browser: None,
             sidebar_scroll: 0.0,
             hover: Hover::default(),
             chat_frame: ChatFrame::default(),
@@ -818,6 +847,8 @@ impl App {
         let welcome = self.welcome_visible();
         let mut changed = false;
         let mut seen_now = Vec::new();
+        // Buffers seen or left: the server hears what was read.
+        let mut read = Vec::new();
         for (n, network) in self.networks.iter_mut().enumerate() {
             let shown = n == self.active && !welcome && focused;
             for (b, buffer) in network.state.buffers.iter_mut().enumerate() {
@@ -826,13 +857,19 @@ impl App {
                     changed |= buffer.unread > 0 || buffer.activity != Default::default();
                     buffer.set_seen(true);
                     seen_now.push((network.id.0, buffer.key.clone()));
+                    read.push((n, b));
                 } else if !seen && buffer.seen {
                     buffer.leave();
+                    read.push((n, b));
                 }
             }
         }
         seen_now.retain(|key| self.noticed(key));
         self.withdraw_seen(seen_now);
+        for (network, buffer) in read {
+            self.mark_read_on_server(network, buffer);
+        }
+        self.first_show();
         if changed {
             self.mark_strip();
             self.mark_sidebar();
@@ -882,6 +919,7 @@ impl App {
         if index != network.active {
             network.buffer_mut().leave();
             network.active = index;
+            self.browser = None;
             self.forget_pointer_state();
             // Keep the row in view.
             if let Some(rect) = self.regions().and_then(|regions| regions.sidebar) {
@@ -1025,15 +1063,14 @@ impl App {
     }
 
     /// Applies the store's events, then network events until they run out
-    /// or the budget does.
-    fn drain_inbox(&mut self) {
+    /// or the wake's budget does (`deadline`).
+    fn drain_inbox(&mut self, deadline: Instant) {
         self.inbox_ready = false;
         self.store_inbox.arm();
         while let Some(event) = self.store_inbox.next() {
             self.apply_store(event);
         }
         self.net_inbox.arm();
-        let deadline = Instant::now() + NET_BUDGET;
         let mut handled = 0u32;
         while let Some(event) = self.net_inbox.next() {
             self.apply(event);
@@ -1059,6 +1096,7 @@ impl App {
                 Err(error) => eprintln!("rubychat: recent.toml: {error}"),
             },
             StoreEvent::Loaded(Document::Recent, _) | StoreEvent::Saved(_, Ok(())) => {}
+            StoreEvent::Backlog(id, result) => self.backlog_arrived(id, result),
             StoreEvent::Loaded(document, result) => self.startup_loaded(document, result),
             StoreEvent::Saved(_, Err(error)) => eprintln!("rubychat: {error}"),
         }
@@ -1224,6 +1262,9 @@ impl App {
         if down {
             network.lag = None;
             network.state.disconnected();
+            if let Some(list) = &mut network.state.channels {
+                list.finish(Some(String::from("The connection was lost")));
+            }
         }
         let retrying = matches!(
             network.status,
@@ -1240,8 +1281,14 @@ impl App {
             }
             self.remember(id);
             self.run_connect_commands(index);
+            self.resolve_history(index);
+            self.ask_read_markers(index);
         } else if retrying {
             self.next_server(index);
+        }
+        if down {
+            self.resolve_history(index);
+            self.channels_arrived(index);
         }
         self.session_changed();
         self.mark_strip();
@@ -1314,6 +1361,9 @@ impl App {
             let active = self.networks[index].active;
             if applied.buffers.contains(&active) {
                 self.mark_chat();
+                if self.networks[index].buffer().seen {
+                    self.read_while_seen(index, active);
+                }
             }
             if applied.details.contains(&active) || applied.list {
                 self.mark_header();
@@ -1331,6 +1381,24 @@ impl App {
         if applied.list {
             self.session_changed();
         }
+        if applied.channels {
+            self.channels_arrived(index);
+        }
+        for &buffer in &applied.buffers {
+            self.log_lines(index, buffer);
+        }
+        // Read on another client: its notification goes, and the badges.
+        if !applied.read.is_empty() {
+            let id = self.networks[index].id;
+            let keys: Vec<_> = applied
+                .read
+                .iter()
+                .map(|&buffer| (id.0, self.networks[index].state.buffers[buffer].key.clone()))
+                .collect();
+            self.withdraw_seen(keys);
+            self.mark_strip();
+            self.mark_sidebar();
+        }
     }
 
     /// Where the sidebar, header, chat view, input bar and nick list go.
@@ -1345,7 +1413,8 @@ impl App {
         let channel = self
             .networks
             .get(self.active)
-            .is_some_and(|network| network.buffer().kind == BufferKind::Channel);
+            .is_some_and(|network| network.buffer().kind == BufferKind::Channel)
+            && !self.browsing();
         let nicks = (self.show_nicks
             && channel
             && width - left - NICK_LIST_WIDTH >= MIN_CHAT_WIDTH)
@@ -1407,6 +1476,7 @@ impl App {
             marker: buffer.marker,
             label_chars: buffer.label_chars,
             filter: self.smart_filter,
+            loading: buffer.history.loading,
         };
         // Whole pixels, so what's shown can move rather than repaint; the
         // remainder carries over.
@@ -1423,6 +1493,9 @@ impl App {
         if anchor != buffer.anchor {
             buffer.anchor = anchor;
             self.mark(|dirty| dirty.scrolled = true);
+        }
+        if pixels > 0.0 {
+            self.near_top();
         }
     }
 
@@ -1442,14 +1515,19 @@ impl App {
     }
 
     fn editor(&mut self) -> &mut LineEditor {
+        let browsing = self.browsing();
         // Disjoint fields, so each arm borrows only its own.
         match (
             &mut self.manager,
             self.networks.is_empty() || self.prompt_open,
+            &mut self.find,
+            &mut self.browser,
         ) {
-            (Some(manager), _) => &mut manager.editor,
-            (None, true) => &mut self.prompt,
-            (None, false) => &mut self.networks[self.active].buffer_mut().input,
+            (Some(manager), ..) => &mut manager.editor,
+            (None, true, ..) => &mut self.prompt,
+            (None, false, Some(find), _) => &mut find.editor,
+            (None, false, None, Some(browser)) if browsing => &mut browser.filter,
+            (None, false, ..) => &mut self.networks[self.active].buffer_mut().input,
         }
     }
 
@@ -1484,6 +1562,7 @@ impl App {
             Key::Character(text) if control => {
                 match text.to_lowercase().as_str() {
                     "t" => self.open_prompt(),
+                    "f" if !welcome => self.open_find(None),
                     "w" if !welcome => {
                         let index = self.networks[self.active].active;
                         self.close_buffer(index);
@@ -1493,7 +1572,11 @@ impl App {
                         self.editor().select_all();
                         self.mark_input();
                     }
-                    "j" if !welcome => self.start_join(),
+                    "j" if !welcome => {
+                        self.close_find();
+                        self.close_channels();
+                        self.start_join();
+                    }
                     "c" => self.copy(),
                     "x" => self.cut(),
                     "v" => self.paste(),
@@ -1514,9 +1597,13 @@ impl App {
             Key::Named(NamedKey::ArrowUp) if alt && !welcome => return self.cycle_buffer(-1),
             Key::Named(NamedKey::ArrowDown) if alt && !welcome => return self.cycle_buffer(1),
             Key::Named(NamedKey::Tab) if control => return self.cycle(if shift { -1 } else { 1 }),
-            Key::Named(NamedKey::Tab) if !welcome => return self.complete(shift),
+            Key::Named(NamedKey::Tab) if !welcome && self.find.is_none() && !self.browsing() => {
+                return self.complete(shift);
+            }
             Key::Named(NamedKey::PageDown) if control => return self.cycle(1),
             Key::Named(NamedKey::PageUp) if control => return self.cycle(-1),
+            Key::Named(NamedKey::PageUp) if self.browsing() => return self.move_selection(-2),
+            Key::Named(NamedKey::PageDown) if self.browsing() => return self.move_selection(2),
             Key::Named(NamedKey::PageUp) => return self.scroll_chat(self.page()),
             Key::Named(NamedKey::PageDown) => return self.scroll_chat(-self.page()),
             Key::Named(NamedKey::End) if control => return self.return_to_present(),
@@ -1529,6 +1616,37 @@ impl App {
                 return self.mark_body();
             }
             Key::Named(NamedKey::Escape) if self.prompt_open => return self.close_prompt(),
+            // The find field: Enter and Up go to earlier matches,
+            // Shift+Enter and Down to later ones.
+            Key::Named(NamedKey::Escape) if !welcome && self.find.is_some() => {
+                return self.close_find();
+            }
+            Key::Named(NamedKey::Enter) if !welcome && self.find.is_some() => {
+                self.find_edited();
+                return self.find_step(!shift);
+            }
+            Key::Named(NamedKey::ArrowUp) if !welcome && self.find.is_some() => {
+                self.find_edited();
+                return self.find_step(true);
+            }
+            Key::Named(NamedKey::ArrowDown) if !welcome && self.find.is_some() => {
+                self.find_edited();
+                return self.find_step(false);
+            }
+            Key::Named(NamedKey::Tab) if !welcome && self.find.is_some() => return,
+            // The channel list: rows are chosen with the arrows and
+            // joined with Enter, Tab sorts the other way.
+            Key::Named(NamedKey::Escape) if self.browsing() => return self.close_channels(),
+            Key::Named(NamedKey::Enter) if self.browsing() => return self.join_selected(),
+            Key::Named(NamedKey::ArrowUp) if self.browsing() => return self.move_selection(-1),
+            Key::Named(NamedKey::ArrowDown) if self.browsing() => return self.move_selection(1),
+            Key::Named(NamedKey::Tab) if self.browsing() => {
+                let order = match self.networks[self.active].state.channels.as_ref() {
+                    Some(list) if list.order() == Order::Users => Order::Name,
+                    _ => Order::Users,
+                };
+                return self.sort_channels(order);
+            }
             Key::Named(NamedKey::Escape) if !welcome => {
                 // Clear the selection and return to the present.
                 if self.selection.take().is_some() {
@@ -1694,6 +1812,14 @@ impl App {
             if hover.nick.is_some() {
                 cursor = CursorIcon::Pointer;
             }
+        } else if regions.chat.contains(point) && self.browsing() {
+            let rows = self.channel_rows();
+            let scroll = self.browser.as_ref().map_or(0.0, |browser| browser.scroll);
+            let part = TableLayout::new(regions.chat).part_at(point, scroll, rows);
+            if part.is_some() {
+                cursor = CursorIcon::Pointer;
+            }
+            self.table_hover(part);
         } else if regions.chat.contains(point) {
             hover.link = self.chat_frame.link_at(point);
             cursor = if hover.link.is_some() {
@@ -1765,6 +1891,13 @@ impl App {
                 (Some(nick), MouseButton::Right) => self.open_nick_menu(&nick, point),
                 _ => {}
             }
+        } else if regions.chat.contains(point) && self.browsing() {
+            if button == MouseButton::Left {
+                let rows = self.channel_rows();
+                let scroll = self.browser.as_ref().map_or(0.0, |browser| browser.scroll);
+                let part = TableLayout::new(regions.chat).part_at(point, scroll, rows);
+                self.table_press(part, double);
+            }
         } else if regions.chat.contains(point) {
             let link = self.chat_frame.link_at(point).map(|(_, _, target)| target);
             let nick = self.chat_frame.nick_at(point).map(str::to_string);
@@ -1815,6 +1948,8 @@ impl App {
             let buffer = self.networks[self.active].buffer_mut();
             buffer.nick_scroll = (buffer.nick_scroll - pixels).max(0.0);
             self.mark_nicks();
+        } else if self.browsing() {
+            self.scroll_table(pixels);
         } else {
             self.scroll_chat(pixels);
         }
@@ -1872,6 +2007,15 @@ impl App {
         let manager_connect = self.manager_connect_label();
         let (saved_rows, suggested) = self.start_saved_rows();
         let trust_layout = self.trust_layout();
+        let browsing = self.browsing();
+        let channels_detail = self.channels_detail();
+        let selected_row = self.selected_row();
+        let current_match = self.current_match();
+        let shown_name = self
+            .networks
+            .get(self.active)
+            .map(|network| network.buffer().name.clone())
+            .unwrap_or_default();
         let App {
             view,
             text,
@@ -1893,6 +2037,8 @@ impl App {
             trust_hover,
             start_saved_hover,
             smart_filter,
+            find,
+            browser,
             ..
         } = self;
         // What repainted below the strip: overlays paint over it, and only
@@ -2051,10 +2197,41 @@ impl App {
                     damage.add(rect.snap(scale));
                 }
                 if dirty.body || dirty.header {
-                    paint_header(&mut painter, regions.header, network);
+                    if browsing {
+                        let view = HeaderView {
+                            name: "Channels",
+                            detail: &channels_detail,
+                            topic: None,
+                            placeholder: "Type to filter by name or topic · Enter joins · Tab sorts · Esc closes",
+                        };
+                        header::paint_header(&mut painter, regions.header, &view);
+                    } else {
+                        paint_header(&mut painter, regions.header, network);
+                    }
                     damage.add(regions.header.snap(scale));
                 }
-                if dirty.body || dirty.chat || dirty.scrolled {
+                if browsing && (dirty.body || dirty.chat || dirty.scrolled) {
+                    if let (Some(browser), Some(list)) =
+                        (browser.as_mut(), network.state.channels.as_ref())
+                    {
+                        let table = TableView {
+                            list,
+                            scroll: browser.scroll,
+                            selected: selected_row,
+                            hovered: browser.hovered,
+                            filtered: !browser.filter.text().is_empty(),
+                            focused,
+                        };
+                        browser.scroll = channel_list::paint_table(
+                            &mut painter,
+                            &TableLayout::new(regions.chat),
+                            &table,
+                        );
+                    }
+                    // Nothing of the chat view is under the pointer.
+                    *chat_frame = ChatFrame::default();
+                    damage.add(regions.chat.snap(scale));
+                } else if dirty.body || dirty.chat || dirty.scrolled {
                     let scrolled = !dirty.body && !dirty.chat && menu.is_none();
                     let state = &mut network.state;
                     let buffer = &mut state.buffers[network.active];
@@ -2066,6 +2243,7 @@ impl App {
                             marker: buffer.marker,
                             label_chars: buffer.label_chars,
                             filter: *smart_filter,
+                            loading: buffer.history.loading,
                         },
                         anchor: buffer.anchor,
                         selection: selection.map(|s| chat_view::ordered(s.anchor, s.focus)),
@@ -2073,6 +2251,13 @@ impl App {
                             .link
                             .as_ref()
                             .map(|(id, range, _)| (*id, range.clone())),
+                        found: find
+                            .as_ref()
+                            .and_then(|find| find.query())
+                            .map(|query| Found {
+                                query,
+                                current: current_match.clone(),
+                            }),
                         focused,
                     };
                     let previous = std::mem::take(chat_frame);
@@ -2096,14 +2281,54 @@ impl App {
                         (input.width - 24.0).max(0.0),
                         (input.height - 16.0).max(0.0),
                     );
-                    let prompt = format!("{}\u{203a}", network.state.nick);
-                    let buffer = network.buffer();
-                    let placeholder = match buffer.kind {
-                        BufferKind::Server => String::from("Type /help for commands"),
-                        _ => format!("Message {}", buffer.name),
-                    };
-                    let editor = &mut network.buffer_mut().input;
-                    paint_input(&mut painter, field, editor, &prompt, &placeholder, focused);
+                    if let Some(find) = find.as_mut() {
+                        let placeholder = format!(
+                            "Find in {shown_name} · Enter: earlier · Shift+Enter: later · Esc closes"
+                        );
+                        let note = find.note;
+                        paint_input(
+                            &mut painter,
+                            field,
+                            &mut find.editor,
+                            "FIND\u{203a}",
+                            &placeholder,
+                            focused,
+                            note,
+                        );
+                    } else if let Some(browser) = browser.as_mut().filter(|_| browsing) {
+                        let note = network
+                            .state
+                            .channels
+                            .as_ref()
+                            .is_some_and(|list| list.settling())
+                            .then_some("FILTERING");
+                        paint_input(
+                            &mut painter,
+                            field,
+                            &mut browser.filter,
+                            "FILTER\u{203a}",
+                            "Channel name or topic",
+                            focused,
+                            note,
+                        );
+                    } else {
+                        let prompt = format!("{}\u{203a}", network.state.nick);
+                        let buffer = network.buffer();
+                        let placeholder = match buffer.kind {
+                            BufferKind::Server => String::from("Type /help for commands"),
+                            _ => format!("Message {}", buffer.name),
+                        };
+                        let editor = &mut network.buffer_mut().input;
+                        paint_input(
+                            &mut painter,
+                            field,
+                            editor,
+                            &prompt,
+                            &placeholder,
+                            focused,
+                            None,
+                        );
+                    }
                     damage.add(input.snap(scale));
                 }
                 if (dirty.body || dirty.nicks)
@@ -2330,6 +2555,9 @@ impl ApplicationHandler<AppEvent> for App {
                 self.mark_all();
             }
             WindowEvent::Focused(focused) => {
+                if self.trace {
+                    eprintln!("focused: {focused}");
+                }
                 if let Some(view) = &mut self.view {
                     view.focused = focused;
                     if !focused {
@@ -2455,8 +2683,11 @@ impl ApplicationHandler<AppEvent> for App {
             event_loop.exit();
             return;
         }
+        // One budget for the wake's work: draining, then the channel
+        // list's slice, so input waits at most this long (DESIGN.md §10).
+        let deadline = Instant::now() + NET_BUDGET;
         if self.inbox_ready {
-            self.drain_inbox();
+            self.drain_inbox(deadline);
         }
         self.desktop_inbox.arm();
         while let Some(event) = self.desktop_inbox.next() {
@@ -2466,6 +2697,13 @@ impl ApplicationHandler<AppEvent> for App {
         while let Some(request) = self.instance_inbox.next() {
             self.handed_over(request);
         }
+        // What was typed into the find field or the channel filter applies,
+        // a search waiting for history carries on, and the channel list
+        // takes its next slice of work.
+        self.find_edited();
+        self.find_resume();
+        self.channels_edited();
+        self.step_channels(deadline);
         if self.quit {
             event_loop.exit();
             return;

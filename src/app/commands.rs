@@ -27,6 +27,7 @@ const COMMANDS: &[&str] = &[
     "invite",
     "join",
     "kick",
+    "list",
     "me",
     "mode",
     "msg",
@@ -40,6 +41,7 @@ const COMMANDS: &[&str] = &[
     "quote",
     "raw",
     "reconnect",
+    "search",
     "server",
     "topic",
     "unignore",
@@ -56,6 +58,7 @@ const HELP: &[&str] = &[
     "/ctcp <nick> <command>, /quote <line> (also /raw), /clear",
     "/connect <server>, /reconnect, /disconnect [reason]",
     "/ignore [nick|mask], /unignore <nick|mask>; /filter hides joins, parts and quits of people who haven't spoken lately",
+    "/list [channels or conditions] browses the network's channels; /search <text> (Ctrl+F) finds text here, earlier history included",
     "Alt+Up/Down or Alt+1–9 switch buffers, Ctrl+Tab networks; Ctrl+J joins, Ctrl+W closes; Tab completes; F7 and F8 hide the nick list and sidebar.",
     "Any other /command is sent as a raw line: /whowas ruby sends WHOWAS ruby.",
 ];
@@ -337,6 +340,8 @@ impl App {
                 }
             }
             "join" | "j" => self.join(args),
+            "list" => self.open_channels(args),
+            "search" => self.open_find((!args.is_empty()).then_some(args)),
             "part" | "leave" => self.part(args),
             "close" => {
                 let active = self.networks[index].active;
@@ -610,6 +615,9 @@ impl App {
                     network.push(shown, LineKind::Sent, "→", what);
                 }
             }
+        }
+        if let Some(index) = buffer {
+            self.log_lines(self.active, index);
         }
         let shown = self.networks[self.active].active;
         if buffer.is_none_or(|index| index == shown) {
