@@ -3,7 +3,8 @@
 //! file in the same directory, flushed to disk, then renamed over the old
 //! one. Missing directories are created with mode 0700 and existing ones
 //! keep their permissions (XDG Base Directory Specification, "Referencing
-//! this specification").
+//! this specification"). Secrets are written readable by their owner alone,
+//! and saves queued for the same file collapse into the newest.
 
 use std::fs;
 use std::io::{self, Write};
@@ -13,18 +14,35 @@ use std::thread::JoinHandle;
 
 use crate::platform::paths;
 
-/// A file RubyChat keeps.
+/// A file RubyChat keeps (DESIGN.md §11).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Document {
     /// `$XDG_STATE_HOME/rubychat/recent.toml`: recently used servers.
     Recent,
+    /// `$XDG_CONFIG_HOME/rubychat/networks.toml`: saved networks.
+    Networks,
+    /// `$XDG_CONFIG_HOME/rubychat/secrets.toml`: passwords, owner-only.
+    Secrets,
+    /// `$XDG_CONFIG_HOME/rubychat/known_hosts`: certificate pins.
+    KnownHosts,
+    /// `$XDG_STATE_HOME/rubychat/session.toml`: what was open at exit.
+    Session,
 }
 
 impl Document {
     pub fn path(self) -> Option<PathBuf> {
         match self {
             Document::Recent => paths::state_dir().map(|dir| dir.join("recent.toml")),
+            Document::Networks => paths::config_dir().map(|dir| dir.join("networks.toml")),
+            Document::Secrets => paths::config_dir().map(|dir| dir.join("secrets.toml")),
+            Document::KnownHosts => paths::config_dir().map(|dir| dir.join("known_hosts")),
+            Document::Session => paths::state_dir().map(|dir| dir.join("session.toml")),
         }
+    }
+
+    /// Readable by its owner alone.
+    fn private(self) -> bool {
+        self == Document::Secrets
     }
 }
 
@@ -57,16 +75,26 @@ impl Store {
             .name(String::from("rubychat-store"))
             .spawn(move || {
                 // Commands run in order, so a save always follows the load
-                // before it, and shutdown waits for pending writes.
-                while let Ok(command) = receiver.recv() {
-                    match command {
-                        Command::Load(document) => {
-                            sink(StoreEvent::Loaded(document, load(document)))
+                // before it, and shutdown waits for pending writes. A save
+                // that a newer one of the same file follows, with no load
+                // between them, is skipped.
+                while let Ok(first) = receiver.recv() {
+                    let mut batch = vec![first];
+                    batch.extend(receiver.try_iter());
+                    let skip: Vec<bool> = (0..batch.len())
+                        .map(|index| superseded(&batch, index))
+                        .collect();
+                    for (command, skip) in batch.into_iter().zip(skip) {
+                        match command {
+                            Command::Load(document) => {
+                                sink(StoreEvent::Loaded(document, load(document)))
+                            }
+                            Command::Save(..) if skip => {}
+                            Command::Save(document, text) => {
+                                sink(StoreEvent::Saved(document, save(document, &text)))
+                            }
+                            Command::Shutdown => return,
                         }
-                        Command::Save(document, text) => {
-                            sink(StoreEvent::Saved(document, save(document, &text)))
-                        }
-                        Command::Shutdown => break,
                     }
                 }
             })?;
@@ -95,14 +123,46 @@ impl Drop for Store {
     }
 }
 
+/// Whether the save at `index` is overtaken by a later save of the same
+/// document, with no load of it between them.
+fn superseded(batch: &[Command], index: usize) -> bool {
+    let Command::Save(document, _) = &batch[index] else {
+        return false;
+    };
+    batch[index + 1..]
+        .iter()
+        .take_while(|later| !matches!(later, Command::Load(d) if d == document))
+        .any(|later| matches!(later, Command::Save(d, _) if d == document))
+}
+
 fn load(document: Document) -> Result<Option<String>, String> {
     let path = document.path().ok_or("no home directory")?;
+    if document.private() {
+        restrict(&path);
+    }
     read(&path).map_err(|error| format!("{}: {error}", path.display()))
 }
 
 fn save(document: Document, text: &str) -> Result<(), String> {
     let path = document.path().ok_or("no home directory")?;
-    write_atomic(&path, text.as_bytes()).map_err(|error| format!("{}: {error}", path.display()))
+    write_atomic(&path, text.as_bytes(), document.private())
+        .map_err(|error| format!("{}: {error}", path.display()))
+}
+
+/// Makes a private file readable by its owner alone again, should someone
+/// have opened it up.
+fn restrict(path: &Path) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if let Ok(metadata) = fs::metadata(path)
+            && metadata.permissions().mode() & 0o077 != 0
+        {
+            let _ = fs::set_permissions(path, fs::Permissions::from_mode(0o600));
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = path;
 }
 
 pub fn read(path: &Path) -> io::Result<Option<String>> {
@@ -121,8 +181,9 @@ pub fn read(path: &Path) -> io::Result<Option<String>> {
 }
 
 /// Writes `bytes` to `path` atomically, creating missing directories with
-/// mode 0700.
-pub fn write_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
+/// mode 0700; a `private` file is readable by its owner alone (0600) from
+/// the moment it exists.
+pub fn write_atomic(path: &Path, bytes: &[u8], private: bool) -> io::Result<()> {
     let directory = path
         .parent()
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "no directory"))?;
@@ -143,7 +204,16 @@ pub fn write_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
         std::process::id()
     ));
     let result = (|| {
-        let mut file = fs::File::create(&temporary)?;
+        let mut options = fs::OpenOptions::new();
+        options.write(true).create(true).truncate(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(if private { 0o600 } else { 0o644 });
+        }
+        #[cfg(not(unix))]
+        let _ = private;
+        let mut file = options.open(&temporary)?;
         file.write_all(bytes)?;
         file.sync_all()?;
         fs::rename(&temporary, path)
@@ -168,8 +238,8 @@ mod tests {
         let root = std::env::temp_dir().join(format!("rubychat-store-{}", std::process::id()));
         let path = root.join("state/rubychat/recent.toml");
         assert_eq!(read(&path).unwrap(), None);
-        write_atomic(&path, b"first").unwrap();
-        write_atomic(&path, b"second").unwrap();
+        write_atomic(&path, b"first", false).unwrap();
+        write_atomic(&path, b"second", true).unwrap();
         assert_eq!(read(&path).unwrap().as_deref(), Some("second"));
         #[cfg(unix)]
         {
@@ -179,9 +249,37 @@ mod tests {
                 .permissions()
                 .mode();
             assert_eq!(mode & 0o777, 0o700);
+            let file = fs::metadata(&path).unwrap().permissions().mode();
+            assert_eq!(file & 0o777, 0o600, "a private file is the owner's alone");
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+            restrict(&path);
+            assert_eq!(
+                fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
         }
         let leftovers: Vec<_> = fs::read_dir(path.parent().unwrap()).unwrap().collect();
         assert_eq!(leftovers.len(), 1, "no temporary files left");
         fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn newer_saves_overtake_older_ones() {
+        let save = |document, text: &str| Command::Save(document, text.to_string());
+        let batch = [
+            save(Document::Session, "a"),
+            save(Document::Networks, "n"),
+            save(Document::Session, "b"),
+            Command::Load(Document::Session),
+            save(Document::Session, "c"),
+        ];
+        let skipped: Vec<bool> = (0..batch.len())
+            .map(|index| superseded(&batch, index))
+            .collect();
+        assert_eq!(
+            skipped,
+            [true, false, false, false, false],
+            "a load in between keeps the save before it"
+        );
     }
 }

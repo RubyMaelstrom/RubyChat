@@ -5,11 +5,13 @@ record: read the sections that govern a change before making it, and update
 the document in the same change when a decision moves.
 
 Status: milestones M0 (window, renderer, tab strip), M1 (IRC over TCP and
-TLS, the server buffer and input line) and M2 (channels and queries, sidebar,
+TLS, the server buffer and input line), M2 (channels and queries, sidebar,
 header, nick list, chat view, commands, completion, Wayland clipboard,
-context menus) are implemented; DESIGN.md §16 lists what M2 left for later.
-M3 (saved servers and logins) is next. DESIGN.md §17 records the settled
-decisions.
+context menus) and M3 (saved networks and secrets, the Server Manager, SASL
+PLAIN, SCRAM-SHA-256 and EXTERNAL, NickServ, certificate policies, pins and
+the trust prompt, client certificates, session restore) are implemented;
+DESIGN.md §16 lists what each left for later. M4 (tray and desktop) is next.
+DESIGN.md §17 records the settled decisions.
 
 ## Binding rules
 
@@ -69,9 +71,15 @@ the user's explicit approval.
   exit. Together they check the real window without screenshots, for
   example `RUBYCHAT_EXIT_AFTER=9 RUBYCHAT_SNAPSHOT=scratch/shot.png
   target/release/rubychat irc.libera.chat` (`scratch/` is ignored by git).
+- RubyChat now keeps a session and pins: runs that connect anywhere should
+  use throwaway directories, so the user's next start isn't changed, for
+  example `XDG_CONFIG_HOME=$PWD/scratch/xdg/config
+  XDG_STATE_HOME=$PWD/scratch/xdg/state target/release/rubychat …`. A
+  `networks.toml` there tries saved networks, logins included.
 - `RUBYCHAT_SNAPSHOTS=DIR cargo test --lib snapshots -- --ignored` writes the
-  tab strip, window and context menu snapshots; `tab-strip-parity.png` uses
-  trust-desktop's preview titles for side-by-side comparison.
+  tab strip, window, context menu, Server Manager and trust prompt
+  snapshots; `tab-strip-parity.png` uses trust-desktop's preview titles for
+  side-by-side comparison.
 - `--demo` opens placeholder networks with channels, members, formatting,
   links, highlights and unread badges: the whole M2 window without
   connecting. `rubychat 'ircs://irc.libera.chat/##rubychat-test'` connects

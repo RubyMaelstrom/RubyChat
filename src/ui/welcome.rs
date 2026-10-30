@@ -1,9 +1,9 @@
 //! The start page: RubyChat's logo, then quick connect in the design of
 //! trust-desktop's COMMAND panel (a chamfered, etched frame with a pink tag,
 //! the cyan prompt, a status line, instrument cells and keycap hints), then
-//! the recently used servers, each a click away. It fills the window while
-//! no network is open, and comes back over the networks for Ctrl+T and the
-//! new-tab button.
+//! saved networks (or suggested ones) beside the recently used servers, each
+//! a click away. It fills the window while no network is open, and comes
+//! back over the networks for Ctrl+T and the new-tab button.
 
 use crate::model::recent::{RecentServer, ago};
 use crate::platform::time;
@@ -11,8 +11,9 @@ use crate::render::{Align, Cap, Color, Image, Painter, Path, Point, Rect};
 
 use super::input::{self, LineEditor};
 use super::theme::{
-    self, AMBER, CANVAS, CYAN, DIM, DISABLED, EDGE, HOVER, INSET, KEY, MUTED, PINK, SURFACE, TEXT,
+    self, AMBER, CANVAS, CYAN, DIM, DISABLED, EDGE, HOVER, INSET, KEY, MUTED, PINK, TEXT,
 };
+use super::widgets::frame;
 
 const PANEL_WIDTH: f32 = 760.0;
 const PANEL_HEIGHT: f32 = 204.0;
@@ -42,12 +43,33 @@ pub struct WelcomeInfo {
     pub can_cancel: bool,
 }
 
+/// A saved network on the start page, or a suggested one.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SavedRow {
+    pub name: String,
+    pub address: String,
+    /// Open, with its jewel's color.
+    pub jewel: Option<Color>,
+}
+
+/// What the pointer is over among the saved networks.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SavedPart {
+    Row(usize),
+    Edit(usize),
+    New,
+}
+
 /// What the start page shows besides the panel.
 #[derive(Clone, Copy, Debug)]
 pub struct StartPage<'a> {
     pub recent: &'a [RecentServer],
     /// The recent server under the pointer.
     pub hovered: Option<usize>,
+    pub saved: &'a [SavedRow],
+    /// The saved rows are suggestions: nothing is saved yet.
+    pub suggested: bool,
+    pub saved_hover: Option<SavedPart>,
     /// The logo, already sized in device pixels.
     pub logo: Option<&'a Image>,
     pub now: i64,
@@ -59,29 +81,34 @@ pub struct StartLayout {
     pub area: Rect,
     pub logo: Option<Rect>,
     pub panel: Rect,
+    /// Saved networks on the left.
+    pub saved: Option<Rect>,
+    pub saved_rows: Vec<Rect>,
+    /// Recent servers on the right.
     pub recent: Option<Rect>,
     /// One row per recent server that fits.
     pub rows: Vec<Rect>,
 }
 
 impl StartLayout {
-    /// Stacks the logo, panel and recent servers, centered a little above
-    /// the middle. Short windows drop the logo first, then recent rows.
-    pub fn new(area: Rect, recent: usize) -> Self {
+    /// Stacks the logo, panel and lists, centered a little above the
+    /// middle: saved networks beside recent servers. Short windows drop the
+    /// logo first, then rows.
+    pub fn new(area: Rect, saved: usize, recent: usize) -> Self {
         let width = PANEL_WIDTH.min(area.width - 32.0).max(0.0).round();
         let panel_height = PANEL_HEIGHT.min(area.height - 32.0).max(0.0);
         let room = area.height - 32.0;
-        let recent_height = |rows: usize| {
+        let lists_height = |rows: usize| {
             if rows == 0 {
                 0.0
             } else {
                 RECENT_GAP + RECENT_HEADER + rows as f32 * RECENT_ROW + RECENT_FOOT
             }
         };
-        let mut rows = recent;
+        let mut rows = saved.max(recent);
         let mut logo = true;
         let total = |logo: bool, rows: usize| {
-            (if logo { LOGO_SIZE + LOGO_GAP } else { 0.0 }) + panel_height + recent_height(rows)
+            (if logo { LOGO_SIZE + LOGO_GAP } else { 0.0 }) + panel_height + lists_height(rows)
         };
         if total(logo, rows) > room {
             logo = false;
@@ -104,10 +131,12 @@ impl StartLayout {
             rect
         });
         let panel = Rect::new(x, y, width, panel_height);
-        y += panel_height;
-        let (recent, rows) = if rows > 0 {
-            let rect = Rect::new(x, y + RECENT_GAP, width, recent_height(rows) - RECENT_GAP);
-            let rows = (0..rows)
+        y += panel_height + RECENT_GAP;
+        let height = lists_height(rows) - RECENT_GAP;
+        let half = ((width - 16.0) / 2.0).floor();
+        let column = |x: f32, width: f32, count: usize| {
+            let rect = Rect::new(x, y, width, height);
+            let rows = (0..count.min(rows))
                 .map(|i| {
                     Rect::new(
                         rect.x + 8.0,
@@ -116,18 +145,59 @@ impl StartLayout {
                         RECENT_ROW,
                     )
                 })
-                .collect();
+                .collect::<Vec<_>>();
             (Some(rect), rows)
-        } else {
-            (None, Vec::new())
+        };
+        let ((saved, saved_rows), (recent, rows)) = match (rows > 0, saved > 0, recent > 0) {
+            (false, ..) => ((None, Vec::new()), (None, Vec::new())),
+            (true, true, true) => (
+                column(x, half, saved),
+                column(x + width - half, half, recent),
+            ),
+            (true, true, false) => (column(x, width, saved), (None, Vec::new())),
+            (true, false, _) => ((None, Vec::new()), column(x, width, recent)),
         };
         Self {
             area,
             logo,
             panel,
+            saved,
+            saved_rows,
             recent,
             rows,
         }
+    }
+
+    /// The saved list's `+ NEW` button.
+    pub fn new_button(&self) -> Option<Rect> {
+        self.saved
+            .map(|rect| Rect::new(rect.right() - 16.0 - 64.0, rect.y + 7.0, 64.0, 18.0))
+    }
+
+    /// A saved row's EDIT button.
+    pub fn edit_button(row: Rect) -> Rect {
+        Rect::new(
+            row.right() - 8.0 - 48.0,
+            (row.center().y - 9.0).round(),
+            48.0,
+            18.0,
+        )
+    }
+
+    /// The saved network, its EDIT button, or `+ NEW` at `point`. Suggested
+    /// networks have no EDIT button.
+    pub fn saved_at(&self, point: Point, suggested: bool) -> Option<SavedPart> {
+        if self
+            .new_button()
+            .is_some_and(|button| button.contains(point))
+        {
+            return Some(SavedPart::New);
+        }
+        let index = self.saved_rows.iter().position(|row| row.contains(point))?;
+        if !suggested && Self::edit_button(self.saved_rows[index]).contains(point) {
+            return Some(SavedPart::Edit(index));
+        }
+        Some(SavedPart::Row(index))
     }
 
     /// The quick-connect field: typing repaints only this.
@@ -144,39 +214,6 @@ impl StartLayout {
     pub fn recent_at(&self, point: Point) -> Option<usize> {
         self.rows.iter().position(|row| row.contains(point))
     }
-}
-
-/// A COMMAND-style frame: chamfered corners, a static shadow, the etched
-/// edge, the pink bar and the cyan underline.
-fn frame(painter: &mut Painter<'_>, panel: Rect, chamfer: f32) {
-    let (right, bottom) = (panel.right(), panel.bottom());
-    // A static, bounded shadow: no blur pass, no animation.
-    for (spread, alpha) in [(8.0, 16), (4.0, 28), (2.0, 48)] {
-        painter.fill_rect(
-            Rect::new(
-                panel.x - spread,
-                panel.y - spread,
-                panel.width + spread * 2.0,
-                panel.height + spread * 2.0,
-            ),
-            Color::rgba(0, 0, 0, alpha),
-        );
-    }
-    let outline = |inset: f32| {
-        Path::polygon(&[
-            Point::new(panel.x + 10.0, panel.y + inset),
-            Point::new(right - chamfer, panel.y + inset),
-            Point::new(right - inset, panel.y + chamfer),
-            Point::new(right - inset, bottom - 10.0),
-            Point::new(right - 10.0, bottom - inset),
-            Point::new(panel.x + inset, bottom - inset),
-            Point::new(panel.x + inset, panel.y + 10.0),
-        ])
-    };
-    painter.fill_path(&outline(0.0), SURFACE);
-    painter.stroke_path(&outline(0.5), 1.0, Cap::Butt, EDGE);
-    painter.fill_rect(Rect::new(panel.x + 10.0, panel.y, 138.0, 2.0), PINK);
-    painter.fill_rect(Rect::new(right - 132.0, bottom - 1.0, 108.0, 1.0), CYAN);
 }
 
 pub fn paint_welcome(
@@ -345,7 +382,89 @@ pub fn paint_welcome(
         x += key_width + action_width + 22.0;
     }
     painter.restore();
+    paint_saved(painter, layout, start);
     paint_recent(painter, layout, start);
+    painter.restore();
+}
+
+fn paint_saved(painter: &mut Painter<'_>, layout: &StartLayout, start: &StartPage<'_>) {
+    let Some(rect) = layout.saved else {
+        return;
+    };
+    frame(painter, rect, 12.0);
+    painter.save_clip(rect);
+    let header = Rect::new(
+        rect.x + 16.0,
+        rect.y + 8.0,
+        rect.width - 32.0,
+        RECENT_HEADER - 12.0,
+    );
+    let title = if start.suggested {
+        "SUGGESTED NETWORKS"
+    } else {
+        "SAVED NETWORKS"
+    };
+    painter.label(title, header, &theme::chrome(9.0), MUTED, Align::Start);
+    if let Some(button) = layout.new_button() {
+        let lit = start.saved_hover == Some(SavedPart::New);
+        painter.fill_rect(button, if lit { INSET } else { KEY });
+        painter.label(
+            "+ NEW",
+            button,
+            &theme::chrome(9.0),
+            if lit { CYAN } else { AMBER },
+            Align::Center,
+        );
+    }
+    for (index, (row, saved)) in layout.saved_rows.iter().zip(start.saved).enumerate() {
+        let hovered =
+            matches!(start.saved_hover, Some(SavedPart::Row(i) | SavedPart::Edit(i)) if i == index);
+        if hovered {
+            painter.fill_rect(*row, HOVER);
+            painter.fill_rect(Rect::new(row.x, row.y, 2.0, row.height), CYAN);
+        }
+        let center = row.y + row.height / 2.0;
+        let jewel = Rect::new(row.x + 10.0, (center - 2.5).round(), 5.0, 5.0);
+        painter.fill_rect(
+            jewel,
+            saved.jewel.unwrap_or(if hovered { CYAN } else { DIM }),
+        );
+        let edit = (!start.suggested).then(|| StartLayout::edit_button(*row));
+        let right = edit.map_or(row.right() - 8.0, |button| button.x - 8.0);
+        let name_width = (row.width * 0.36).min(150.0);
+        let name = Rect::new(row.x + 24.0, row.y, name_width, row.height);
+        painter.label(
+            &saved.name,
+            name,
+            &theme::chrome(12.0),
+            if hovered { CYAN } else { TEXT },
+            Align::Start,
+        );
+        let address = Rect::new(
+            name.right() + 8.0,
+            row.y,
+            (right - name.right() - 8.0).max(0.0),
+            row.height,
+        );
+        painter.label(
+            &saved.address,
+            address,
+            &theme::chrome(10.5),
+            MUTED,
+            Align::Start,
+        );
+        if let Some(button) = edit {
+            let lit = start.saved_hover == Some(SavedPart::Edit(index));
+            painter.fill_rect(button, if lit { INSET } else { KEY });
+            painter.label(
+                "EDIT",
+                button,
+                &theme::chrome(9.0),
+                if lit { CYAN } else { AMBER },
+                Align::Center,
+            );
+        }
+    }
     painter.restore();
 }
 
@@ -390,7 +509,12 @@ fn paint_recent(painter: &mut Painter<'_>, layout: &StartLayout, start: &StartPa
             Rect::new(row.x + 10.0, (center - 2.5).round(), 5.0, 5.0),
             if hovered { CYAN } else { DIM },
         );
-        let name = Rect::new(row.x + 24.0, row.y, 210.0, row.height);
+        let name = Rect::new(
+            row.x + 24.0,
+            row.y,
+            210.0f32.min(row.width - 190.0).max(60.0),
+            row.height,
+        );
         painter.label(
             &server.name,
             name,
@@ -416,10 +540,15 @@ fn paint_recent(painter: &mut Painter<'_>, layout: &StartLayout, start: &StartPa
         );
         painter.fill_rect(badge_rect, KEY);
         painter.label(badge, badge_rect, &theme::chrome(9.0), color, Align::Center);
+        // A narrow column keeps the name and the time.
         let address = Rect::new(
             name.right() + 12.0,
             row.y,
-            (badge_rect.x - 12.0 - name.right() - 12.0).max(0.0),
+            if rect.width < 560.0 {
+                0.0
+            } else {
+                (badge_rect.x - 12.0 - name.right() - 12.0).max(0.0)
+            },
             row.height,
         );
         painter.label(
@@ -460,20 +589,47 @@ mod tests {
 
     #[test]
     fn the_page_stacks_and_gives_way_in_short_windows() {
-        let tall = StartLayout::new(Rect::new(0.0, 26.0, 1100.0, 694.0), 5);
+        let tall = StartLayout::new(Rect::new(0.0, 26.0, 1100.0, 694.0), 3, 5);
         let logo = tall.logo.expect("room for the logo");
         assert!(logo.bottom() < tall.panel.y);
         assert_eq!(tall.panel.width, PANEL_WIDTH);
-        assert_eq!(tall.rows.len(), 5);
-        let recent = tall.recent.unwrap();
+        assert_eq!((tall.saved_rows.len(), tall.rows.len()), (3, 5));
+        let (saved, recent) = (tall.saved.unwrap(), tall.recent.unwrap());
+        assert!(saved.right() < recent.x, "side by side");
         assert!(recent.y > tall.panel.bottom() && recent.bottom() <= 26.0 + 694.0);
         assert_eq!(tall.recent_at(tall.rows[2].center()), Some(2));
         assert_eq!(tall.recent_at(tall.panel.center()), None);
-        let short = StartLayout::new(Rect::new(0.0, 26.0, 700.0, 400.0), 5);
+        let row = tall.saved_rows[1];
+        assert_eq!(tall.saved_at(row.center(), false), Some(SavedPart::Row(1)));
+        assert_eq!(
+            tall.saved_at(StartLayout::edit_button(row).center(), false),
+            Some(SavedPart::Edit(1))
+        );
+        assert_eq!(
+            tall.saved_at(StartLayout::edit_button(row).center(), true),
+            Some(SavedPart::Row(1)),
+            "suggestions have no EDIT"
+        );
+        assert_eq!(
+            tall.saved_at(tall.new_button().unwrap().center(), false),
+            Some(SavedPart::New)
+        );
+        let short = StartLayout::new(Rect::new(0.0, 26.0, 700.0, 400.0), 5, 5);
         assert!(short.logo.is_none(), "the logo goes first");
         assert!(short.rows.len() < 5 && short.recent.is_none_or(|r| r.bottom() <= 426.0));
-        let none = StartLayout::new(Rect::new(0.0, 26.0, 1100.0, 694.0), 0);
-        assert!(none.recent.is_none() && none.rows.is_empty());
+        let only_saved = StartLayout::new(Rect::new(0.0, 26.0, 1100.0, 694.0), 5, 0);
+        assert!(only_saved.recent.is_none() && only_saved.saved.unwrap().width == PANEL_WIDTH);
+    }
+
+    fn rows() -> Vec<SavedRow> {
+        ["Libera.Chat", "OFTC", "hackint"]
+            .iter()
+            .map(|name| SavedRow {
+                name: name.to_string(),
+                address: format!("irc.{}:6697", name.to_ascii_lowercase()),
+                jewel: (*name == "OFTC").then_some(CYAN),
+            })
+            .collect()
     }
 
     /// `RUBYCHAT_SNAPSHOTS=DIR cargo test --lib window_snapshots -- --ignored`
@@ -539,13 +695,18 @@ mod tests {
             };
             let mut editor = LineEditor::default();
             editor.insert("irc.oftc.net");
+            let saved = rows();
             let layout = StartLayout::new(
                 Rect::new(0.0, STRIP_HEIGHT, width, height - STRIP_HEIGHT),
+                saved.len(),
                 recent.len(),
             );
             let start = StartPage {
                 recent: &recent,
                 hovered: Some(1),
+                saved: &saved,
+                suggested: false,
+                saved_hover: Some(SavedPart::Edit(0)),
                 logo: Some(logo.at((LOGO_SIZE * scale).round() as u32)),
                 now,
             };
@@ -567,10 +728,14 @@ mod tests {
         let area = Rect::new(0.0, 50.0, 400.0, 250.0);
         let mut painter = Painter::new(&mut canvas, &mut text, 1.0);
         let recent = servers(2);
-        let layout = StartLayout::new(area, recent.len());
+        let saved = rows();
+        let layout = StartLayout::new(area, saved.len(), recent.len());
         let start = StartPage {
             recent: &recent,
             hovered: None,
+            saved: &saved,
+            suggested: true,
+            saved_hover: None,
             logo: None,
             now: 0,
         };

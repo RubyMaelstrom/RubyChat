@@ -1146,6 +1146,7 @@ dependencies = [
 name = "rubychat"
 version = "0.1.0"
 dependencies = [
+ "aws-lc-rs",
  "harfrust",
  "libc",
  "mio",

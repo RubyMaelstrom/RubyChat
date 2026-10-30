@@ -20,6 +20,10 @@ pub(super) enum MenuAction {
     Query(String),
     MarkRead(usize),
     Close(usize),
+    /// Opens the editor on this saved network.
+    EditSaved(String),
+    /// Opens the editor to save the shown network.
+    SaveOpen,
 }
 
 pub(super) struct Menu {
@@ -106,30 +110,10 @@ impl App {
 
     /// The menu changed: what lies under it repaints, then the menu over it.
     fn mark_under_menu(&mut self) {
-        let (Some(menu), Some(regions)) = (&self.menu, self.regions()) else {
-            return;
-        };
-        let damage = menu.geometry.damage();
-        let over = |rect: Rect| {
-            rect.x < damage.right()
-                && damage.x < rect.right()
-                && rect.y < damage.bottom()
-                && damage.y < rect.bottom()
-        };
-        let (sidebar, header, chat, input, nicks) = (
-            regions.sidebar.is_some_and(over),
-            over(regions.header),
-            over(regions.chat),
-            over(regions.input),
-            regions.nicks.is_some_and(over),
-        );
-        self.mark(|dirty| {
-            dirty.sidebar |= sidebar;
-            dirty.header |= header;
-            dirty.chat |= chat;
-            dirty.input |= input;
-            dirty.nicks |= nicks;
-        });
+        if let Some(menu) = &self.menu {
+            let reach = menu.geometry.damage();
+            self.mark_under(reach);
+        }
     }
 
     /// Pointer motion while a menu is open: it highlights the item under it.
@@ -222,6 +206,17 @@ impl App {
                 }
             }
             MenuAction::Close(index) => self.close_buffer(index),
+            MenuAction::EditSaved(name) => {
+                if let Some(index) = self
+                    .saved
+                    .list
+                    .iter()
+                    .position(|network| network.name == name)
+                {
+                    self.open_manager(Some(index));
+                }
+            }
+            MenuAction::SaveOpen => self.save_open_network(self.active),
         }
     }
 
@@ -249,6 +244,17 @@ impl App {
                     MenuItem::new("Copy server address", MenuIcon::Copy),
                     MenuAction::Copy(address),
                 );
+                match &network.saved {
+                    Some(name) => menu.add(
+                        MenuItem::new("Edit network", MenuIcon::Command),
+                        MenuAction::EditSaved(name.clone()),
+                    ),
+                    None if !network.demo => menu.add(
+                        MenuItem::new("Save network", MenuIcon::Check),
+                        MenuAction::SaveOpen,
+                    ),
+                    None => {}
+                }
                 let close = MenuItem::new("Close network", MenuIcon::Leave)
                     .caution()
                     .shortcut("Ctrl+W");

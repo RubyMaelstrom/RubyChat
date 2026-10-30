@@ -435,3 +435,171 @@ fn an_irc_url_opens_its_channel_and_joins_with_its_key() {
     ));
     assert_eq!(sent(&app), ["JOIN #foobar bazqux"]);
 }
+
+fn saved_libera() -> crate::config::networks::SavedNetwork {
+    use crate::config::networks::{AutoJoin, Login, LoginMethod, SavedNetwork, SavedServer};
+    SavedNetwork {
+        name: String::from("Libera.Chat"),
+        servers: vec![
+            SavedServer::new("irc.libera.chat", 6697, true),
+            SavedServer::new("irc.eu.libera.chat", 6697, true),
+        ],
+        nick: String::from("ruby"),
+        login: Login {
+            method: LoginMethod::SaslPlain,
+            account: String::from("ruby"),
+            password: String::from("hunter2"),
+            require: true,
+            client_certificate: String::new(),
+        },
+        autojoin: vec![
+            AutoJoin {
+                channel: String::from("#rust"),
+                key: String::new(),
+            },
+            AutoJoin {
+                channel: String::from("#secret"),
+                key: String::from("sesame"),
+            },
+        ],
+        commands: vec![String::from("/mode ruby +R")],
+        part_message: String::from("bye for now"),
+        ..SavedNetwork::default()
+    }
+}
+
+#[test]
+fn saved_networks_connect_with_their_logins_channels_and_commands() {
+    let mut app = app();
+    app.known_hosts.pin("irc.libera.chat", 6697, [7; 32]);
+    app.connect_saved(&saved_libera(), None).unwrap();
+    let NetCommand::Connect(id, config) = app.sent.borrow_mut().remove(0) else {
+        panic!("connects first");
+    };
+    assert!(
+        matches!(&config.login, crate::net::Login::Sasl { account, password, .. } if account == "ruby" && password == "hunter2")
+    );
+    assert!(config.require_login);
+    assert_eq!(config.pins, [[7; 32]], "pinned in known_hosts");
+    assert_eq!(shown(&app), "#rust", "the first channel shows at once");
+    app.apply(NetEvent::Status(
+        id,
+        LinkStatus::Registered {
+            nick: String::from("ruby"),
+        },
+    ));
+    assert_eq!(
+        sent(&app),
+        ["JOIN #secret,#rust sesame", "MODE ruby +R"],
+        "keyed channels first, then the commands"
+    );
+    receive(&mut app, id, ":ruby!u@h JOIN #rust");
+    let rust = network(&app).state.find("#rust").unwrap();
+    app.close_buffer(rust);
+    assert_eq!(sent(&app), ["PART #rust :bye for now"]);
+}
+
+#[test]
+fn a_failing_server_hands_over_to_the_next() {
+    let mut app = app();
+    app.saved.list.push(saved_libera());
+    app.connect_saved(&saved_libera(), None).unwrap();
+    let id = network(&app).id;
+    app.sent.borrow_mut().clear();
+    let reason = String::from("Connection refused");
+    app.apply(NetEvent::Status(
+        id,
+        LinkStatus::Disconnected {
+            reason,
+            retry_in: Some(Duration::from_secs(2)),
+        },
+    ));
+    let commands = app.sent.borrow_mut().drain(..).collect::<Vec<_>>();
+    assert!(
+        matches!(commands.as_slice(), [NetCommand::Update(_, config)] if config.host == "irc.eu.libera.chat"),
+        "{commands:?}"
+    );
+}
+
+#[test]
+fn sessions_restore_what_was_open() {
+    let mut app = app();
+    app.saved.list.push(saved_libera());
+    app.connect_saved(&saved_libera(), None).unwrap();
+    let id = network(&app).id;
+    app.apply(NetEvent::Status(
+        id,
+        LinkStatus::Registered {
+            nick: String::from("ruby"),
+        },
+    ));
+    receive(&mut app, id, ":ruby!u@h JOIN #rust");
+    receive(&mut app, id, ":bob!b@h PRIVMSG ruby :hi");
+    let quick = commands::parse_server("irc://irc.example.net/#chat").unwrap();
+    app.connect(quick);
+    app.activate(0);
+    let bob = network(&app).state.find("bob").unwrap();
+    app.activate_buffer(bob);
+    let session = app.session();
+    assert_eq!(session.networks.len(), 2);
+    assert_eq!(
+        (
+            session.networks[0].name.as_str(),
+            session.networks[0].shown.as_str(),
+            session.active
+        ),
+        ("Libera.Chat", "bob", 0)
+    );
+    let names: Vec<&str> = session.networks[0]
+        .buffers
+        .iter()
+        .map(|b| b.name.as_str())
+        .collect();
+    assert_eq!(names, ["#rust", "#secret", "bob"]);
+    // The next start opens the same.
+    let mut next = super::tests::app();
+    next.saved.list.push(saved_libera());
+    next.keep_session = true;
+    next.startup.session = Some(Some(session.clone()));
+    next.start();
+    assert_eq!(next.networks.len(), 2);
+    assert_eq!(next.active, 0);
+    assert_eq!(shown(&next), "bob");
+    let restored = next.session();
+    assert_eq!(restored.networks[0].buffers, session.networks[0].buffers);
+    assert_eq!(restored.networks[1].host, "irc.example.net");
+}
+
+#[test]
+fn the_trust_prompt_trusts_once_or_pins() {
+    let mut app = app();
+    let id = registered(&mut app);
+    let problem = || {
+        Box::new(crate::net::CertificateProblem {
+            host: String::from("irc.test"),
+            port: 6697,
+            fingerprint: [9; 32],
+            reason: String::from("it signed itself"),
+            changed: false,
+            facts: None,
+        })
+    };
+    app.certificate_refused(id, problem());
+    assert!(app.trust.is_some());
+    app.answer_certificate(None);
+    assert!(app.sent.borrow().is_empty(), "cancelled: nothing happens");
+    app.certificate_refused(id, problem());
+    app.answer_certificate(Some(false));
+    let commands = app.sent.borrow_mut().drain(..).collect::<Vec<_>>();
+    assert!(
+        matches!(commands.as_slice(), [NetCommand::Connect(_, config)] if config.pins.contains(&[9; 32]))
+    );
+    assert_eq!(
+        app.known_hosts.get("irc.test", 6697),
+        None,
+        "trusted once, not pinned"
+    );
+    app.certificate_refused(id, problem());
+    app.answer_certificate(Some(true));
+    assert_eq!(app.known_hosts.get("irc.test", 6697), Some([9; 32]));
+}

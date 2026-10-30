@@ -10,10 +10,13 @@
 mod chrome;
 mod commands;
 mod demo;
+mod manager;
 mod menus;
 mod present;
+mod startup;
 #[cfg(test)]
 mod tests;
+mod trust;
 
 use std::ops::Range;
 use std::rc::Rc;
@@ -143,6 +146,9 @@ pub fn run(options: Options) -> Result<(), String> {
     };
     let mut app = App::new(options, waker)?;
     event_loop.run_app(&mut app).map_err(|e| e.to_string())?;
+    // What was open, for next time, while it still is.
+    app.session_changed();
+    app.save_session();
     // Dropping the handles says QUIT to every server and finishes pending
     // writes.
     drop(app.net.take());
@@ -177,6 +183,12 @@ struct Network {
     lag: Option<Duration>,
     /// A `--demo` placeholder that never connects.
     demo: bool,
+    /// The saved network it is, by name.
+    saved: Option<String>,
+    /// Which of the saved network's servers.
+    server: usize,
+    /// Lines to run after each registration, as typed in the server buffer.
+    commands: Vec<String>,
 }
 
 impl Network {
@@ -235,7 +247,15 @@ impl Network {
 
     /// The sidebar's status line.
     fn status_line(&self) -> Status {
-        let tls = if self.config.tls { "TLS" } else { "PLAIN" };
+        // Encryption without a verified identity is shown as such
+        // (DESIGN.md §6.2).
+        let unverified = self.config.tls
+            && self.config.certificate == crate::config::networks::CertificatePolicy::None;
+        let tls = match (self.config.tls, unverified) {
+            (false, _) => "PLAIN",
+            (true, true) => "TLS UNVERIFIED",
+            (true, false) => "TLS",
+        };
         let (text, color) = match &self.status {
             _ if self.demo => (String::from("DEMO · NEVER CONNECTS"), MUTED),
             LinkStatus::Registered { .. } => {
@@ -243,7 +263,14 @@ impl Network {
                     Some(lag) => format!("{tls} · {} MS", lag.as_millis()),
                     None => tls.to_string(),
                 };
-                (text, if self.config.tls { CYAN } else { AMBER })
+                (
+                    text,
+                    if self.config.tls && !unverified {
+                        CYAN
+                    } else {
+                        AMBER
+                    },
+                )
             }
             LinkStatus::Resolving | LinkStatus::Connecting => (String::from("CONNECTING"), AMBER),
             LinkStatus::Registering => (String::from("REGISTERING"), AMBER),
@@ -347,6 +374,23 @@ pub struct App {
     /// `RUBYCHAT_CHECK_CLIPBOARD`: once the window has the keyboard, paste
     /// and then copy, reporting both (diagnostics). True once done.
     check_clipboard: Option<bool>,
+    /// Saved networks with their secrets (DESIGN.md §11).
+    saved: crate::config::networks::Networks,
+    /// Why saved networks didn't load; they are then never saved over.
+    saved_error: Option<String>,
+    known_hosts: crate::config::known_hosts::KnownHosts,
+    startup: startup::Startup,
+    /// Restore and save the session: not for `--demo` or tests.
+    keep_session: bool,
+    session_dirty: bool,
+    /// A certificate waiting for the trust prompt's answer.
+    trust: Option<(NetworkId, Box<crate::net::CertificateProblem>)>,
+    trust_focus: crate::ui::trust::TrustAction,
+    trust_hover: Option<crate::ui::trust::TrustAction>,
+    /// The Server Manager's editor, while open.
+    manager: Option<manager::Manager>,
+    /// The saved network (or button) under the pointer on the start page.
+    start_saved_hover: Option<crate::ui::welcome::SavedPart>,
     /// `RUBYCHAT_EXIT_AFTER`: quit cleanly at this time (diagnostics).
     exit_at: Option<Instant>,
 }
@@ -470,6 +514,17 @@ impl App {
             waker: Box::new(waker),
             pasted: mpsc::channel(),
             check_clipboard: std::env::var_os("RUBYCHAT_CHECK_CLIPBOARD").map(|_| false),
+            saved: Default::default(),
+            saved_error: None,
+            known_hosts: Default::default(),
+            startup: Default::default(),
+            keep_session: !options.demo && !options.isolated,
+            session_dirty: false,
+            trust: None,
+            trust_focus: crate::ui::trust::TrustAction::Cancel,
+            trust_hover: None,
+            manager: None,
+            start_saved_hover: None,
             exit_at: std::env::var("RUBYCHAT_EXIT_AFTER")
                 .ok()
                 .and_then(|seconds| seconds.parse::<f64>().ok())
@@ -478,10 +533,8 @@ impl App {
         if options.demo {
             app.open_demo();
         }
-        for address in &options.connect {
-            let server = commands::parse_server(address)?;
-            app.connect(server);
-        }
+        app.startup.addresses = options.connect;
+        app.begin_startup();
         Ok(app)
     }
 
@@ -497,6 +550,9 @@ impl App {
             active: 0,
             lag: None,
             demo: false,
+            saved: None,
+            server: 0,
+            commands: Vec::new(),
         });
         id
     }
@@ -607,6 +663,7 @@ impl App {
     fn update_title(&self) {
         if let Some(view) = &self.view {
             let title = match self.networks.get(self.active) {
+                _ if self.manager.is_some() => String::from("Servers — RubyChat"),
                 Some(network) if !self.welcome_visible() => match network.buffer().kind {
                     BufferKind::Server => format!("{} — RubyChat", network.title),
                     _ => format!("{} — {} — RubyChat", network.buffer().name, network.title),
@@ -620,7 +677,70 @@ impl App {
     /// The welcome panel shows while nothing is open, or over the networks
     /// for quick connect.
     fn welcome_visible(&self) -> bool {
-        self.networks.is_empty() || self.prompt_open
+        self.networks.is_empty() || self.prompt_open || self.manager.is_some()
+    }
+
+    /// What lies under an overlay (a menu, the trust prompt) repaints, then
+    /// the overlay over it.
+    pub(super) fn mark_under(&mut self, reach: Rect) {
+        if self.welcome_visible() {
+            return self.mark_body();
+        }
+        let Some(regions) = self.regions() else {
+            return;
+        };
+        let over = |rect: Rect| {
+            rect.x < reach.right()
+                && reach.x < rect.right()
+                && rect.y < reach.bottom()
+                && reach.y < rect.bottom()
+        };
+        let (sidebar, header, chat, input, nicks) = (
+            regions.sidebar.is_some_and(over),
+            over(regions.header),
+            over(regions.chat),
+            over(regions.input),
+            regions.nicks.is_some_and(over),
+        );
+        self.mark(|dirty| {
+            dirty.sidebar |= sidebar;
+            dirty.header |= header;
+            dirty.chat |= chat;
+            dirty.input |= input;
+            dirty.nicks |= nicks;
+        });
+    }
+
+    /// The start page's saved networks, or suggestions when none are saved.
+    fn start_saved_rows(&self) -> (Vec<crate::ui::welcome::SavedRow>, bool) {
+        use crate::ui::welcome::SavedRow;
+        if self.saved.list.is_empty() {
+            let rows = crate::config::networks::PRESETS
+                .iter()
+                .map(|(name, host, port)| SavedRow {
+                    name: name.to_string(),
+                    address: format!("{host}:{port}"),
+                    jewel: None,
+                })
+                .collect();
+            return (rows, true);
+        }
+        let rows = self
+            .saved
+            .list
+            .iter()
+            .zip(self.manager_list())
+            .map(|(saved, (_, jewel))| SavedRow {
+                name: saved.name.clone(),
+                address: saved
+                    .servers
+                    .first()
+                    .map(|server| server.address())
+                    .unwrap_or_default(),
+                jewel,
+            })
+            .collect();
+        (rows, false)
     }
 
     /// Network `index` is on screen.
@@ -672,6 +792,7 @@ impl App {
             }
             self.sync_seen();
             self.update_title();
+            self.session_changed();
         }
     }
 
@@ -705,6 +826,7 @@ impl App {
                         .reveal(index);
             }
             self.mark_body();
+            self.session_changed();
         }
         self.sync_seen();
         self.update_title();
@@ -777,6 +899,7 @@ impl App {
         self.sync_seen();
         self.mark_all();
         self.update_title();
+        self.session_changed();
     }
 
     /// Closes buffer `index` of the active network, parting a channel you
@@ -796,9 +919,15 @@ impl App {
             && network.connected()
             && !network.demo
         {
-            let line = format!("PART {}", buffer.name);
-            let id = network.id;
-            self.send(NetCommand::Send(id, line));
+            let reason = network.state.part_message.as_str();
+            let mut params = vec![buffer.name.as_str()];
+            if !reason.is_empty() {
+                params.push(reason);
+            }
+            if let Ok(line) = crate::irc::serialize(&[], None, "PART", &params) {
+                let id = network.id;
+                self.send(NetCommand::Send(id, line));
+            }
         }
         let network = &mut self.networks[self.active];
         // Show the row above the closed one.
@@ -816,6 +945,7 @@ impl App {
         self.sync_seen();
         self.mark_body();
         self.update_title();
+        self.session_changed();
     }
 
     /// Whether anything is animating: only a connecting network's jewel.
@@ -859,10 +989,9 @@ impl App {
                 }
                 Err(error) => eprintln!("rubychat: recent.toml: {error}"),
             },
-            StoreEvent::Loaded(_, Ok(None)) | StoreEvent::Saved(_, Ok(())) => {}
-            StoreEvent::Loaded(_, Err(error)) | StoreEvent::Saved(_, Err(error)) => {
-                eprintln!("rubychat: {error}");
-            }
+            StoreEvent::Loaded(Document::Recent, _) | StoreEvent::Saved(_, Ok(())) => {}
+            StoreEvent::Loaded(document, result) => self.startup_loaded(document, result),
+            StoreEvent::Saved(_, Err(error)) => eprintln!("rubychat: {error}"),
         }
     }
 
@@ -890,29 +1019,77 @@ impl App {
     /// Where the start page's parts are.
     fn start_layout(&self) -> Option<StartLayout> {
         let regions = self.regions()?;
-        Some(StartLayout::new(regions.body, self.recent.servers().len()))
+        let saved = if self.saved.list.is_empty() {
+            crate::config::networks::PRESETS.len()
+        } else {
+            self.saved.list.len()
+        };
+        Some(StartLayout::new(
+            regions.body,
+            saved,
+            self.recent.servers().len(),
+        ))
     }
 
     /// Hover over the start page's recent servers.
     fn start_pointer_moved(&mut self) {
         let point = self.view.as_ref().map(|view| view.pointer);
-        let hovered = match (point, self.start_layout()) {
-            (Some(point), Some(layout)) => layout.recent_at(point),
-            _ => None,
+        let suggested = self.saved.list.is_empty();
+        let (hovered, saved) = match (point, self.start_layout()) {
+            (Some(point), Some(layout)) => {
+                (layout.recent_at(point), layout.saved_at(point, suggested))
+            }
+            _ => (None, None),
         };
-        if hovered != self.start_hover {
+        if hovered != self.start_hover || saved != self.start_saved_hover {
             self.start_hover = hovered;
+            self.start_saved_hover = saved;
             self.mark_all();
         }
-        self.set_cursor(if hovered.is_some() {
+        self.set_cursor(if hovered.is_some() || saved.is_some() {
             CursorIcon::Pointer
         } else {
             CursorIcon::Default
         });
     }
 
-    /// A click on a recent server connects to it.
+    /// A click on a saved or recent server connects to it; EDIT and NEW
+    /// open the editor.
     fn start_pointer_pressed(&mut self) {
+        use crate::ui::welcome::SavedPart;
+        if let Some(part) = self.start_saved_hover.take() {
+            match part {
+                SavedPart::New => self.open_manager(None),
+                SavedPart::Edit(index) => self.open_manager(Some(index)),
+                SavedPart::Row(index) if self.saved.list.is_empty() => {
+                    if let Some((_, host, port)) = crate::config::networks::PRESETS.get(index) {
+                        self.connect(commands::Server {
+                            host: host.to_string(),
+                            port: *port,
+                            tls: true,
+                            password: None,
+                            entity: None,
+                        });
+                    }
+                }
+                SavedPart::Row(index) => {
+                    let Some(saved) = self.saved.list.get(index).cloned() else {
+                        return;
+                    };
+                    match self
+                        .networks
+                        .iter()
+                        .position(|n| n.saved.as_deref() == Some(saved.name.as_str()))
+                    {
+                        Some(open) => self.activate(open),
+                        None => {
+                            self.connect_saved(&saved, None);
+                        }
+                    }
+                }
+            }
+            return;
+        }
         if let Some(index) = self.start_hover
             && let Some(server) = self.recent.servers().get(index).cloned()
         {
@@ -951,6 +1128,7 @@ impl App {
             }
             // The UI shows what the user sends as they send it.
             NetEvent::Sent(..) => {}
+            NetEvent::Certificate(id, problem) => self.certificate_refused(id, problem),
         }
     }
 
@@ -972,6 +1150,13 @@ impl App {
             network.lag = None;
             network.state.disconnected();
         }
+        let retrying = matches!(
+            network.status,
+            LinkStatus::Disconnected {
+                retry_in: Some(_),
+                ..
+            }
+        );
         if registered {
             // Back in the channels you were in, and those waiting to be
             // joined.
@@ -979,8 +1164,15 @@ impl App {
                 self.send(NetCommand::Send(id, line));
             }
             self.remember(id);
+            self.run_connect_commands(index);
+        } else if retrying {
+            self.next_server(index);
         }
+        self.session_changed();
         self.mark_strip();
+        if self.manager.is_some() || self.welcome_visible() {
+            self.mark_body();
+        }
         if self.is_shown(index) {
             self.mark_sidebar();
             self.mark_header();
@@ -994,7 +1186,9 @@ impl App {
             return;
         };
         let network = &mut self.networks[index];
+        // A saved network keeps the name it was saved with.
         if message.command() == "005"
+            && network.saved.is_none()
             && let Some(name) = message.params().find_map(|p| p.strip_prefix("NETWORK="))
             && !name.is_empty()
             && network.title != name
@@ -1048,6 +1242,9 @@ impl App {
             }
         } else if badge.is_none_or(|badge| badge != self.networks[index].badge()) {
             self.mark_strip();
+        }
+        if applied.list {
+            self.session_changed();
         }
     }
 
@@ -1159,10 +1356,14 @@ impl App {
     }
 
     fn editor(&mut self) -> &mut LineEditor {
-        if self.welcome_visible() {
-            &mut self.prompt
-        } else {
-            &mut self.networks[self.active].buffer_mut().input
+        // Disjoint fields, so each arm borrows only its own.
+        match (
+            &mut self.manager,
+            self.networks.is_empty() || self.prompt_open,
+        ) {
+            (Some(manager), _) => &mut manager.editor,
+            (None, true) => &mut self.prompt,
+            (None, false) => &mut self.networks[self.active].buffer_mut().input,
         }
     }
 
@@ -1177,8 +1378,14 @@ impl App {
         if event.state != ElementState::Pressed {
             return;
         }
+        if self.trust.is_some() {
+            return self.trust_key(event);
+        }
         if self.menu.is_some() && self.menu_key(&event.logical_key) {
             return;
+        }
+        if self.manager.is_some() {
+            return self.manager_key(event);
         }
         let control = self.modifiers.control_key();
         let shift = self.modifiers.shift_key();
@@ -1303,6 +1510,9 @@ impl App {
             let text = editor.text()[range.clone()].to_string();
             editor.replace(range, "");
             self.mark_input();
+            if self.manager.is_some() {
+                self.manager_edited();
+            }
             self.put_on_clipboard(text);
         }
     }
@@ -1348,6 +1558,9 @@ impl App {
         if !line.is_empty() {
             self.editor().insert(&line);
             self.mark_input();
+            if self.manager.is_some() {
+                self.manager_edited();
+            }
         }
     }
 
@@ -1557,8 +1770,17 @@ impl App {
         };
         let pulse = tab_strip::heartbeat(self.started.elapsed());
         let start_layout = self.start_layout();
+        // Until saved networks and the session load (a few milliseconds),
+        // nothing: the start page would flash before they open.
+        let starting = !self.startup.done;
         let logo_size = self.view.as_ref().map_or(1.0, |view| view.scale) * LOGO_SIZE;
         let now = now_ms();
+        let manager_entries = self.manager_entries();
+        let manager_layout = self.manager_layout(&manager_entries);
+        let manager_list = self.manager_list();
+        let manager_connect = self.manager_connect_label();
+        let (saved_rows, suggested) = self.start_saved_rows();
+        let trust_layout = self.trust_layout();
         let App {
             view,
             text,
@@ -1574,8 +1796,16 @@ impl App {
             chat_frame,
             selection,
             menu,
+            manager,
+            trust,
+            trust_focus,
+            trust_hover,
+            start_saved_hover,
             ..
         } = self;
+        // What repainted below the strip: overlays paint over it, and only
+        // there.
+        let mut repainted: Vec<Rect> = Vec::new();
         let (Some(view), Some(regions)) = (view.as_mut(), regions) else {
             return;
         };
@@ -1631,10 +1861,56 @@ impl App {
                 tab_strip::paint_tab_strip(&mut painter, &geometry, &tabs, &state);
                 damage.add(Rect::new(0.0, 0.0, width, STRIP_HEIGHT).snap(scale));
             }
-            if welcome && let Some(start_layout) = &start_layout {
+            let below = dirty.body
+                || dirty.chat
+                || dirty.sidebar
+                || dirty.header
+                || dirty.nicks
+                || dirty.input;
+            if welcome && starting {
+                painter.fill_rect(regions.body, crate::ui::theme::CANVAS);
+                damage.add(regions.body.snap(scale));
+            } else if let (Some(manager), Some(layout)) = (manager.as_mut(), &manager_layout) {
+                if below {
+                    let list = Self::manager_list_entries(&manager_list);
+                    let title = if manager.draft.name.trim().is_empty() {
+                        String::from("New network")
+                    } else {
+                        manager.draft.name.clone()
+                    };
+                    let dirty_draft = manager.dirty();
+                    let mut view = crate::ui::manager::ManagerView {
+                        networks: &list,
+                        selected: manager.selected,
+                        title: &title,
+                        entries: &manager_entries,
+                        focus: manager.focus,
+                        editor: &mut manager.editor,
+                        hover: manager.hover,
+                        message: manager
+                            .message
+                            .as_ref()
+                            .map(|(text, problem)| (text.as_str(), *problem)),
+                        dirty: dirty_draft,
+                        connect: manager_connect,
+                        focused,
+                    };
+                    crate::ui::manager::paint_manager(
+                        &mut painter,
+                        regions.body,
+                        layout,
+                        &mut view,
+                    );
+                    damage.add(regions.body.snap(scale));
+                    repainted.push(regions.body);
+                }
+            } else if welcome && let Some(start_layout) = &start_layout {
                 let start = StartPage {
                     recent: recent.servers(),
                     hovered: *start_hover,
+                    saved: &saved_rows,
+                    suggested,
+                    saved_hover: *start_saved_hover,
                     logo: Some(logo.at(logo_size.round() as u32)),
                     now,
                 };
@@ -1647,6 +1923,7 @@ impl App {
                         &start,
                     );
                     damage.add(regions.body.snap(scale));
+                    repainted.push(regions.body);
                 } else if dirty.input {
                     // Only the field changed: repaint the page clipped to it.
                     let field = start_layout.input();
@@ -1660,6 +1937,7 @@ impl App {
                     );
                     painter.restore();
                     damage.add(field.snap(scale));
+                    repainted.push(field);
                 }
             } else if let Some(network) = networks.get_mut(*active) {
                 if (dirty.body || dirty.sidebar)
@@ -1749,28 +2027,46 @@ impl App {
                     network.buffer_mut().nick_scroll = shown;
                     damage.add(rect.snap(scale));
                 }
-                // An open menu goes over whatever repainted beneath it, and
-                // only there, so its translucent edges never paint twice.
-                if let Some(menu) = menu.as_ref() {
-                    let reach = menu.geometry.damage();
-                    let repainted = [
+                repainted.extend(
+                    [
                         regions.sidebar.filter(|_| dirty.body || dirty.sidebar),
                         (dirty.body || dirty.header).then_some(regions.header),
-                        (dirty.body || dirty.chat).then_some(regions.chat),
+                        (dirty.body || dirty.chat || dirty.scrolled).then_some(regions.chat),
                         (dirty.body || dirty.input).then_some(regions.input),
                         regions.nicks.filter(|_| dirty.body || dirty.nicks),
-                    ];
-                    for rect in repainted.into_iter().flatten() {
-                        if rect.x < reach.right()
-                            && reach.x < rect.right()
-                            && rect.y < reach.bottom()
-                            && reach.y < rect.bottom()
-                        {
-                            painter.save_clip(rect);
-                            menu.paint(&mut painter);
-                            painter.restore();
-                        }
-                    }
+                    ]
+                    .into_iter()
+                    .flatten(),
+                );
+            }
+            // Overlays go over whatever repainted beneath them, and only
+            // there, so their translucent edges never paint twice.
+            let meets = |rect: &Rect, reach: Rect| {
+                rect.x < reach.right()
+                    && reach.x < rect.right()
+                    && rect.y < reach.bottom()
+                    && reach.y < rect.bottom()
+            };
+            if let Some(menu) = menu.as_ref().filter(|_| !welcome) {
+                for rect in repainted
+                    .iter()
+                    .filter(|rect| meets(rect, menu.geometry.damage()))
+                {
+                    painter.save_clip(*rect);
+                    menu.paint(&mut painter);
+                    painter.restore();
+                }
+            }
+            if let (Some((_, problem)), Some(layout)) = (trust.as_ref(), &trust_layout) {
+                let view = crate::ui::trust::TrustView {
+                    problem,
+                    focus: *trust_focus,
+                    hover: *trust_hover,
+                };
+                for rect in repainted.iter().filter(|rect| meets(rect, layout.damage())) {
+                    painter.save_clip(*rect);
+                    crate::ui::trust::paint_trust(&mut painter, layout, &view);
+                    painter.restore();
                 }
             }
         }
@@ -1934,13 +2230,17 @@ impl ApplicationHandler<AppEvent> for App {
                         position.y as f32 / view.scale,
                     );
                 }
-                if let Some(point) = self.view.as_ref().map(|view| view.pointer)
+                if self.trust.is_some() {
+                    self.trust_pointer_moved();
+                } else if let Some(point) = self.view.as_ref().map(|view| view.pointer)
                     && self.menu.is_some()
                 {
                     self.menu_pointer_moved(point);
                     self.set_cursor(CursorIcon::Default);
                 } else if !self.chrome_pointer_moved() {
-                    if self.welcome_visible() {
+                    if self.manager.is_some() {
+                        self.manager_pointer_moved();
+                    } else if self.welcome_visible() {
                         self.start_pointer_moved();
                     } else {
                         self.body_pointer_moved();
@@ -1960,6 +2260,12 @@ impl ApplicationHandler<AppEvent> for App {
                 }
             }
             WindowEvent::MouseInput { state, button, .. } => {
+                if self.trust.is_some() {
+                    if state == ElementState::Pressed && button == MouseButton::Left {
+                        self.trust_pointer_pressed();
+                    }
+                    return;
+                }
                 if state == ElementState::Pressed
                     && let Some(point) = self.view.as_ref().map(|view| view.pointer)
                     && self.menu_pointer_pressed(point, button == MouseButton::Right)
@@ -1970,6 +2276,11 @@ impl ApplicationHandler<AppEvent> for App {
                     return;
                 }
                 match state {
+                    ElementState::Pressed if self.manager.is_some() => {
+                        if button == MouseButton::Left {
+                            self.manager_pointer_pressed();
+                        }
+                    }
                     ElementState::Pressed if self.welcome_visible() => {
                         if button == MouseButton::Left {
                             self.start_pointer_pressed();
@@ -1984,13 +2295,18 @@ impl ApplicationHandler<AppEvent> for App {
             }
             WindowEvent::MouseWheel { delta, .. } => {
                 self.close_menu();
+                if self.trust.is_some() {
+                    return;
+                }
                 if !self.chrome_scroll(delta) {
                     let scale = self.view.as_ref().map_or(1.0, |view| view.scale);
                     let pixels = match delta {
                         MouseScrollDelta::LineDelta(_, y) => y * 3.0 * 20.0,
                         MouseScrollDelta::PixelDelta(position) => position.y as f32 / scale,
                     };
-                    if !self.welcome_visible() {
+                    if self.manager.is_some() {
+                        self.manager_scroll(pixels);
+                    } else if !self.welcome_visible() {
                         self.body_scroll(pixels);
                     }
                 }
@@ -2017,6 +2333,7 @@ impl ApplicationHandler<AppEvent> for App {
         if self.inbox_ready {
             self.drain_inbox();
         }
+        self.save_session();
         #[cfg(all(unix, not(target_vendor = "apple")))]
         if let Some(clipboard) = &mut self.clipboard {
             clipboard.dispatch();

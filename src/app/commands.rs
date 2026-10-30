@@ -6,7 +6,7 @@
 use crate::irc::serialize;
 use crate::model::LineKind;
 use crate::model::buffer::BufferKind;
-use crate::net::{ConnectConfig, NetCommand, redact};
+use crate::net::{NetCommand, redact};
 use crate::platform::time::now_ms;
 
 use super::App;
@@ -205,7 +205,7 @@ pub(super) fn parse_server(input: &str) -> Result<Server, String> {
 }
 
 /// A nickname from the login name, kept to the characters IRC allows.
-fn default_nick() -> String {
+pub(super) fn default_nick() -> String {
     let login = std::env::var("USER")
         .or_else(|_| std::env::var("USERNAME"))
         .unwrap_or_default();
@@ -277,36 +277,7 @@ impl App {
     }
 
     pub(super) fn connect(&mut self, server: Server) {
-        let mut config =
-            ConnectConfig::new(server.host.clone(), server.port, server.tls, default_nick());
-        config.password = server.password;
-        let title = server
-            .host
-            .strip_prefix("irc.")
-            .unwrap_or(&server.host)
-            .to_string();
-        let id = self.add_network(title, config.clone());
-        // What the address names opens at once; a channel joins on
-        // registering.
-        let network = self.networks.last_mut().expect("just added");
-        match server.entity {
-            Some(Entity::Channel { name, key }) => {
-                let (index, _) = network.state.open(BufferKind::Channel, &name);
-                let buffer = &mut network.state.buffers[index];
-                buffer.rejoin = true;
-                // Where rejoining looks for the key, until the server says.
-                buffer.modes.extend(key.map(|key| ('k', Some(key))));
-                network.active = index;
-            }
-            Some(Entity::Nick(nick)) => {
-                network.active = network.state.open(BufferKind::Query, &nick).0
-            }
-            None => {}
-        }
-        self.send(NetCommand::Connect(id, config));
-        self.prompt_open = false;
-        self.activate(self.networks.len() - 1);
-        self.mark_all();
+        self.open_server(server, None);
     }
 
     pub(super) fn run_command(&mut self, line: &str) {
@@ -678,6 +649,12 @@ impl App {
             return self.say(LineKind::Error, "!", format!("{name} isn't open."));
         };
         let buffer = &network.state.buffers[index];
+        // Without a reason, the network's part message.
+        let reason = if reason.is_empty() {
+            network.state.part_message.as_str()
+        } else {
+            reason
+        };
         if buffer.joined && network.connected() && !network.demo {
             let mut params = vec![name.as_str()];
             if !reason.is_empty() {

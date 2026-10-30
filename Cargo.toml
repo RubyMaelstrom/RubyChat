@@ -17,12 +17,15 @@ path = "src/main.rs"
 # Every dependency is justified, with its measured transitive cost, in
 # docs/DESIGN.md §4. Add a row there before adding a crate here.
 [dependencies]
+# SCRAM's SHA-256, HMAC and PBKDF2, and certificate fingerprints: the crypto
+# provider rustls already runs on, with the same features.
+aws-lc-rs = { version = "1.18.1", default-features = false, features = ["aws-lc-sys"] }
 # OpenType shaping (the HarfBuzz port). Shares read-fonts with skrifa.
 harfrust = "0.12.0"
 # Socket readiness and a cross-thread waker for the network thread's reactor.
 mio = { version = "1.2.4", features = ["os-poll", "net"] }
 # TLS 1.2/1.3 on aws-lc-rs, preferring the X25519MLKEM768 hybrid key exchange
-# as TRust does. aws-lc-rs also supplies SCRAM's SHA-256, HMAC and PBKDF2.
+# as TRust does.
 rustls = { version = "0.23.45", default-features = false, features = ["aws-lc-rs", "std", "tls12", "prefer-post-quantum"] }
 # Font tables, outlines and light hinting for RubyChat's own rasterizer.
 skrifa = "0.44.0"

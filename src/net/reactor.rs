@@ -21,8 +21,8 @@ pub(super) struct Ctx<'a> {
     pub tokens: &'a mut Tokens,
     pub sink: &'a mut dyn FnMut(NetEvent),
     pub resolver: &'a Resolver,
-    /// `None` if TLS could not be configured; TLS connections then fail.
-    pub tls: Option<&'a Arc<rustls::ClientConfig>>,
+    /// `None` if TLS could not be set up; TLS connections then fail.
+    pub tls: Option<&'a tls::Shared>,
     pub now: Instant,
 }
 
@@ -97,7 +97,7 @@ pub(super) fn run(
     commands: mpsc::Receiver<NetCommand>,
     mut sink: Box<dyn FnMut(NetEvent) + Send>,
 ) {
-    let tls = tls::client_config().ok();
+    let tls = tls::shared().ok();
     let (resolved_tx, resolved_rx) = mpsc::channel();
     let resolver = Resolver {
         tx: resolved_tx,
@@ -153,6 +153,11 @@ pub(super) fn run(
                     link.set_config(config);
                     link.connect(&mut ctx);
                 }
+                Ok(NetCommand::Update(id, config)) => {
+                    if let Some(link) = links.get_mut(&id) {
+                        link.set_config(config);
+                    }
+                }
                 Ok(NetCommand::Send(id, line)) => {
                     if let Some(link) = links.get_mut(&id) {
                         link.send(&mut ctx, line);
@@ -165,12 +170,12 @@ pub(super) fn run(
                 }
                 Ok(NetCommand::Close(id)) => {
                     if let Some(mut link) = links.remove(&id) {
-                        link.shutdown(&mut ctx, "RubyChat");
+                        link.shutdown(&mut ctx);
                     }
                 }
                 Ok(NetCommand::Shutdown) | Err(mpsc::TryRecvError::Disconnected) => {
                     for link in links.values_mut() {
-                        link.shutdown(&mut ctx, "RubyChat");
+                        link.shutdown(&mut ctx);
                     }
                     return;
                 }

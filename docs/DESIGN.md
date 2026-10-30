@@ -1,7 +1,7 @@
 # RubyChat design
 
-Draft 2 · 30 October 2026 · decisions settled (§17); milestones M0, M1 and
-M2 are implemented (§16).
+Draft 2 · 30 October 2026 · decisions settled (§17); milestones M0 to M3
+are implemented (§16).
 
 RubyChat is a desktop IRC client written in Rust. Its overriding goal is that
 nothing on the client side ever makes you wait. It draws its own interface in
@@ -85,8 +85,10 @@ trust-desktop's Parley and Vello CPU text stack plus ksni for the tray would
 make 190; AccessKit adds 71; arboard with Wayland data-control adds 18; zbus
 on its own is 67.
 
-Used directly because winit already brings them: libc (Unix), windows-sys
-(Windows), wayland-client and x11rb (clipboard).
+Used directly because winit or rustls already brings them, with the same
+features: libc (Unix), windows-sys (Windows), wayland-client and x11rb
+(clipboard), and aws-lc-rs (SCRAM's SHA-256, HMAC and PBKDF2, randomness,
+and certificate fingerprints).
 
 Hand-built: the IRC parser, serializer and session state machines; Happy
 Eyeballs connection racing; SOCKS5; SASL PLAIN, SCRAM-SHA-256 and EXTERNAL;
@@ -225,6 +227,17 @@ Server password; SASL PLAIN (RFC 4616), SCRAM-SHA-256 (RFC 5802, RFC 7677)
 and EXTERNAL (RFC 4422 appendix A); NickServ IDENTIFY for networks without
 SASL. With "require login" set, a failed SASL exchange disconnects instead of
 continuing unidentified.
+
+As built (IRCv3 SASL 3.1 and 3.2): `sasl` is requested only when its
+`CAP LS` value offers the chosen mechanism, or names none; `CAP END` waits
+for the exchange to finish. Responses go in 400-byte base64 chunks. With a
+required login, a server that doesn't offer SASL, refuses the capability,
+fails the exchange or registers the client without it is disconnected
+without retrying, as the specification asks. SCRAM checks that the server's
+nonce extends the client's and verifies the server's signature, abandoning
+the exchange with `AUTHENTICATE *` otherwise; it refuses iteration counts
+above 100,000, which would stall the network thread, and credentials that
+aren't plain ASCII (§17). NickServ IDENTIFY goes after `001`.
 
 ### 6.6 Keepalive and lag
 
@@ -464,6 +477,20 @@ It opens with Ctrl+T, the `+` button, or Edit network in a tab's context menu.
 On first launch it opens as a welcome screen with quick connect and a few
 well-known networks preset with their TLS addresses.
 
+As built: Ctrl+T and `+` show the start page, the Server Manager's home:
+quick connect, then the saved networks (suggested ones until one is saved)
+beside the recent servers. A saved network connects with a click, or opens
+in the editor with EDIT; `+ NEW` starts one. The server row's context menu
+offers Edit network, or Save network for an address opened with quick
+connect. In the editor, Tab and the arrows move between controls, Enter and
+Space press, Left and Right change choices, Ctrl+S saves, Ctrl+Enter
+connects and Esc closes, asking again when there are unsaved changes.
+Passwords and channel keys stay masked until Show. Connect saves first when
+there are changes, and becomes Disconnect or Reconnect for an open network.
+A pinned server's row offers to forget its pin. Not yet: the tab context
+menu, and advanced settings beyond encoding, flood rate, CTCP replies and
+quit and part messages.
+
 ### 8.10 Other surfaces
 
 - Quick switcher (Ctrl+K): fuzzy search across every buffer of every network,
@@ -619,6 +646,16 @@ as they're measured.
 - Session restore: networks connected at exit, or set to connect at startup,
   reconnect with their channels and queries in their saved order. Each
   buffer's last lines load from its log the first time it's shown.
+- As built: the session keeps networks that are connected or reconnecting,
+  with the channels they are in or joining, their queries, the buffer each
+  shows and the network shown. It is saved as it changes, with queued saves
+  of one file collapsing into the newest, and at exit. Window geometry and
+  read positions are not kept yet; logs arrive with M6. `secrets.toml` is
+  written owner-only from the moment it exists and tightened again if found
+  open. A `networks.toml` that fails to load is never written over. Client
+  certificate paths are taken as given when absolute, under the home
+  directory for `~/`, and in `certs/` otherwise. Keys of channels joined by
+  hand are not kept, so they rejoin without one.
 
 ```toml
 # networks.toml
@@ -747,6 +784,12 @@ the primary selection (middle click) is not supported.
   threads, sent commands captured), so commands, completion, menus and routing
   are tested without a window. Scrolling by moving pixels is checked against
   full repaints at scales 1, 1.5 and 2.
+- Since M3: SASL PLAIN, a required login that fails, and SCRAM against RFC
+  7677's test vector; TLS against a local rustls server presenting the
+  committed self-signed certificates in `src/net/testdata/`: refused with
+  what the prompt shows, trusted by a pin, refused when the pin changed,
+  accepted without verification, and a client certificate presented. The
+  Server Manager and the trust prompt have snapshots.
 - Before handoff: `cargo fmt --check`, `cargo clippy --all-targets`,
   `cargo test`, `cargo test --release`, `cargo build --release`.
 - By hand: Libera.Chat and OFTC over TLS; a local ergo for self-signed
@@ -798,6 +841,17 @@ click, an input bar that grows to eight lines with its byte count and paste
 confirmation, reordering rows by dragging, muting, Alt+A, and the inline
 confirmation before closing a connected network.
 
+M3's scope is implemented and tested: saved networks, secrets, pins and the
+session load before anything connects; a saved network connected at startup
+on Libera.Chat, joined its channel and ran its commands, and the next start
+restored it from the session alone. Logins are tested against scripted
+servers, as no test accounts exist: every method works end to end there
+(EXTERNAL with a real client certificate over TLS). A saved network with
+several servers moves to the next after a failure, on the link's backoff.
+Not yet: STS (M5), creating client certificates in the app, the broken-lock
+icon on the tab (the sidebar says "TLS UNVERIFIED"), and window geometry in
+the session.
+
 | | Scope | Done when |
 |---|---|---|
 | M0 | Window and renderer: skeleton; undecorated window with the ported strip; move, resize, maximize, minimize, close; canvas, damage and presentation; rasterizer; text in embedded JetBrains Mono; tracing; snapshots | The strip snapshot matches TRust's preview, and an idle window wakes nothing |
@@ -837,6 +891,22 @@ Settled while building M2:
     channel (with `?key=`) or, with `,isuser`, a nick to open a query with;
     `user:password@` passes the password as the server password.
 
+Settled while building M3:
+
+11. **SCRAM credentials** must be plain ASCII. RFC 5802 §2.2 lets clients
+    refuse other characters instead of applying SASLprep, which needs
+    Unicode normalization tables RubyChat doesn't carry; SASL PLAIN over TLS
+    takes any password.
+12. **Trusting a certificate** pins it in `known_hosts` and leaves the
+    network's policy as it was: a pinned certificate passes "verify". "Trust
+    once" lasts until the network is closed.
+13. **Ctrl+T** shows the start page, which leads to the editor, rather than
+    opening the editor itself.
+14. **Commands after connecting** run after every registration, as if typed
+    in the server buffer.
+15. **Channel keys** of saved networks live in `secrets.toml`, and the
+    session keeps none.
+
 ## 18. Standards
 
 Read the governing text before implementing; see `web-standards-skill`.
@@ -854,6 +924,11 @@ then, as documents under `documents/`, the XDG Base Directory Specification
 (`xdg-basedir-*`), the Wayland protocol specification (`wayland-protocol-*`,
 for the clipboard) and the IRC URL draft (`irc-url-*`,
 `draft-butcher-irc-url-04`).
+
+M3 follows IRCv3 SASL 3.1 and 3.2, RFC 4616 (PLAIN), RFC 4422 appendix A
+(EXTERNAL), RFC 5802 and 7677 (SCRAM, with 7677's test vector), RFC 4013
+(SASLprep, declined as §17 says), RFC 4648 (base64) and RFC 5280 (the
+certificate fields the trust prompt reads).
 
 Not in the library yet, to be added through the skill's maintenance procedure
 before the milestone that needs them:

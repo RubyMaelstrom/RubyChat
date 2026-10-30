@@ -65,6 +65,10 @@ pub struct NetworkState {
     ctcp_time: i64,
     /// The CTCP VERSION answer.
     pub version: String,
+    /// Answer CTCP queries (VERSION, PING, TIME, CLIENTINFO).
+    pub ctcp_replies: bool,
+    /// PART's reason when none is given.
+    pub part_message: String,
 }
 
 impl NetworkState {
@@ -78,6 +82,8 @@ impl NetworkState {
             ctcp_tokens: CTCP_BURST,
             ctcp_time: 0,
             version: format!("RubyChat {}", env!("CARGO_PKG_VERSION")),
+            ctcp_replies: true,
+            part_message: String::new(),
         }
     }
 
@@ -665,7 +671,7 @@ impl NetworkState {
             "DCC" => format!("{from} offered a DCC transfer, which RubyChat doesn't support"),
             _ => format!("CTCP {verb} from {from}"),
         };
-        if let Some(answer) = answer {
+        if let Some(answer) = answer.filter(|_| self.ctcp_replies) {
             if self.ctcp_allowed(time) {
                 if let Ok(line) =
                     serialize(&[], None, "NOTICE", &[from, &format!("\u{1}{answer}\u{1}")])
