@@ -1,0 +1,13 @@
+# Cargo build output.
+/target/
+# Local scratch files and diagnostic output.
+/scratch/
+*.log
+# Local agent state and editor settings.
+/.claude/
+/.codex/
+/.idea/
+/.vscode/
+# Local environment settings.
+.env
+.env.*

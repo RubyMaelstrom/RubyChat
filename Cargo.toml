@@ -1,0 +1,54 @@
+[package]
+name = "rubychat"
+version = "0.1.0"
+edition = "2024"
+description = "A fast, lightweight desktop IRC client"
+license = "MPL-2.0"
+publish = false
+
+[lib]
+name = "rubychat"
+path = "src/lib.rs"
+
+[[bin]]
+name = "rubychat"
+path = "src/main.rs"
+
+# Every dependency is justified, with its measured transitive cost, in
+# docs/DESIGN.md §4. Add a row there before adding a crate here.
+[dependencies]
+# OpenType shaping (the HarfBuzz port). Shares read-fonts with skrifa.
+harfrust = "0.12.0"
+# Socket readiness and a cross-thread waker for the network thread's reactor.
+mio = { version = "1.2.4", features = ["os-poll", "net"] }
+# TLS 1.2/1.3 on aws-lc-rs, preferring the X25519MLKEM768 hybrid key exchange
+# as TRust does. aws-lc-rs also supplies SCRAM's SHA-256, HMAC and PBKDF2.
+rustls = { version = "0.23.45", default-features = false, features = ["aws-lc-rs", "std", "tls12", "prefer-post-quantum"] }
+# Font tables, outlines and light hinting for RubyChat's own rasterizer.
+skrifa = "0.44.0"
+# Presents CPU-rendered pixels with damage rectangles.
+softbuffer = { version = "0.4.8", default-features = false, features = ["x11", "x11-dlopen", "wayland", "wayland-dlopen"] }
+# Grapheme and word boundaries (UAX #29) for editing and line breaking.
+unicode-segmentation = "1.13.3"
+# Mozilla's root certificates, so verification never depends on the host.
+webpki-roots = "1.0.9"
+# Windows, input, IME and scale factors. Its client-side decorations stay
+# off: the network tab strip is RubyChat's title bar.
+winit = { version = "0.30.13", default-features = false, features = ["x11", "wayland", "wayland-dlopen", "rwh_06"] }
+
+[target.'cfg(unix)'.dependencies]
+# Local time (localtime_r), and the clipboard's pipes. Already in winit's graph.
+libc = "0.2.191"
+
+[target.'cfg(all(unix, not(target_vendor = "apple")))'.dependencies]
+# The Wayland clipboard on winit's connection. Already in winit's graph, with
+# the same features.
+wayland-client = { version = "0.31.15", features = ["system", "dlopen"] }
+
+# The renderer's pixel loops are unusably slow unoptimized; keep debug builds
+# interactive without giving up debug assertions.
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 2
