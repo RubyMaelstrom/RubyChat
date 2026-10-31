@@ -133,7 +133,7 @@ impl App {
         if self.welcome_visible() {
             return;
         }
-        self.close_channels();
+        self.leave_channels();
         self.close_switcher();
         self.close_settings();
         let find = self.find.get_or_insert_with(Find::default);

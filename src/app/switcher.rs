@@ -51,7 +51,6 @@ impl App {
         }
         self.close_menu();
         self.close_find();
-        self.close_channels();
         self.close_settings();
         self.switcher = Some(Switcher::default());
         self.switcher_edited();

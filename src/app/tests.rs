@@ -1068,9 +1068,37 @@ fn the_channel_list_streams_in_filters_sorts_and_joins() {
     assert_eq!(sent(&app), ["JOIN #rusty"]);
     assert!(!app.browsing());
     assert_eq!(shown(&app), "#rusty");
+    // The list keeps its sidebar row: showing it again asks nothing of the
+    // server and finds it as it was left.
+    receive(&mut app, id, ":ruby!u@h JOIN #rusty");
+    app.show_channels();
+    assert!(app.browsing());
+    assert!(sent(&app).is_empty());
+    assert_eq!(names(&app), ["#rust", "#rusty"]);
+    assert_eq!(app.editor().text(), "RUST");
+    // Esc goes back to the buffer, Alt+Down from the server buffer comes
+    // to the list's row, and Alt+Down again to the first channel.
+    app.leave_channels();
+    assert!(!app.browsing());
+    assert_eq!(shown(&app), "#rusty");
+    app.activate_buffer(0);
+    app.cycle_buffer(1);
+    assert!(app.browsing());
+    app.cycle_buffer(1);
+    assert!(!app.browsing());
+    assert_eq!(shown(&app), "#rusty");
+    // Closing its row frees the list.
+    app.show_channels();
+    app.close_channels();
+    assert!(!app.browsing());
+    assert!(app.networks[0].browser.is_none());
+    assert!(app.networks[0].state.channels.is_none());
+    app.show_channels();
+    assert!(!app.browsing());
     // A list ended early says why.
     type_line(&mut app, "/list >10");
     assert_eq!(sent(&app), ["LIST >10"]);
+    assert!(app.browsing());
     receive(
         &mut app,
         id,
@@ -1082,6 +1110,9 @@ fn the_channel_list_streams_in_filters_sorts_and_joins() {
         list.error.as_deref(),
         Some("Server load is temporarily too heavy")
     );
+    // Refreshing asks again with the same conditions.
+    app.refresh_channels();
+    assert_eq!(sent(&app), ["LIST >10"]);
 }
 
 #[test]

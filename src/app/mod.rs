@@ -63,7 +63,9 @@ use crate::ui::chat_view::{self, ChatContext, ChatFrame, ChatView, Found, Target
 use crate::ui::header::{self, HEADER_HEIGHT, HeaderView, thousands};
 use crate::ui::input::{LineEditor, paint_input};
 use crate::ui::nick_list::{self, NICK_LIST_WIDTH};
-use crate::ui::sidebar::{self, SIDEBAR_WIDTH, SidebarLayout, SidebarPart, SidebarView, Status};
+use crate::ui::sidebar::{
+    self, SIDEBAR_WIDTH, SidebarItem, SidebarLayout, SidebarPart, SidebarView, Status,
+};
 use crate::ui::tab_strip::{
     self, STRIP_HEIGHT, StripTab, TabStatus, TabStripGeometry, TabStripState,
 };
@@ -204,6 +206,10 @@ struct Network {
     state: NetworkState,
     /// The buffer shown, by index.
     active: usize,
+    /// The channel list's view, while the list keeps its sidebar row.
+    browser: Option<channels::Browser>,
+    /// The channel list shows instead of buffer `active`.
+    listing: bool,
     lag: Option<Duration>,
     /// A `--demo` placeholder that never connects.
     demo: bool,
@@ -405,8 +411,6 @@ pub struct App {
     settings: Settings,
     /// Ctrl+F's find field, while open.
     find: Option<find::Find>,
-    /// The channel list (`/list`), while it shows.
-    browser: Option<channels::Browser>,
     /// The quick switcher (Ctrl+K), while open.
     switcher: Option<switcher::Switcher>,
     /// The settings panel (`/settings`), while open.
@@ -604,7 +608,6 @@ impl App {
             smart_filter: true,
             settings: Settings::default(),
             find: None,
-            browser: None,
             switcher: None,
             settings_panel: None,
             sidebar_scroll: 0.0,
@@ -660,6 +663,8 @@ impl App {
             config,
             status: LinkStatus::Resolving,
             active: 0,
+            browser: None,
+            listing: false,
             lag: None,
             demo: false,
             saved: None,
@@ -889,7 +894,7 @@ impl App {
         for (n, network) in self.networks.iter_mut().enumerate() {
             let shown = n == self.active && !welcome && focused;
             for (b, buffer) in network.state.buffers.iter_mut().enumerate() {
-                let seen = shown && b == network.active;
+                let seen = shown && b == network.active && !network.listing;
                 if seen && !buffer.seen {
                     changed |= buffer.unread > 0 || buffer.activity != Default::default();
                     buffer.set_seen(true);
@@ -953,17 +958,23 @@ impl App {
         if index >= network.state.buffers.len() {
             return;
         }
-        if index != network.active {
-            network.buffer_mut().leave();
-            network.active = index;
-            self.browser = None;
+        if index != network.active || network.listing {
+            if index != network.active {
+                network.buffer_mut().leave();
+                network.active = index;
+            }
+            network.listing = false;
             self.forget_pointer_state();
             // Keep the row in view.
             if let Some(rect) = self.regions().and_then(|regions| regions.sidebar) {
                 let network = &self.networks[self.active];
-                self.sidebar_scroll =
-                    SidebarLayout::new(rect, &network.state.buffers, self.sidebar_scroll)
-                        .reveal(index);
+                self.sidebar_scroll = SidebarLayout::new(
+                    rect,
+                    &network.state.buffers,
+                    network.browser.is_some(),
+                    self.sidebar_scroll,
+                )
+                .reveal(SidebarItem::Buffer(index));
             }
             self.mark_body();
             self.session_changed();
@@ -986,13 +997,21 @@ impl App {
         let Some(network) = self.networks.get(self.active) else {
             return;
         };
-        let order = sidebar::order(&network.state.buffers);
-        let position = order
-            .iter()
-            .position(|&index| index == network.active)
-            .unwrap_or(0) as isize;
-        let next = order[(position + step).rem_euclid(order.len() as isize) as usize];
-        self.activate_buffer(next);
+        // The sidebar's rows: None is the channel list's, after the server
+        // buffer's.
+        let mut rows: Vec<Option<usize>> = sidebar::order(&network.state.buffers)
+            .into_iter()
+            .map(Some)
+            .collect();
+        if network.browser.is_some() {
+            rows.insert(1.min(rows.len()), None);
+        }
+        let current = (!self.browsing()).then_some(network.active);
+        let position = rows.iter().position(|&row| row == current).unwrap_or(0) as isize;
+        match rows[(position + step).rem_euclid(rows.len() as isize) as usize] {
+            Some(index) => self.activate_buffer(index),
+            None => self.show_channels(),
+        }
     }
 
     /// Pointer state that belongs to the buffer being left.
@@ -1604,15 +1623,19 @@ impl App {
             &mut self.settings_panel,
             &mut self.switcher,
             &mut self.find,
-            &mut self.browser,
         ) {
             (Some(manager), ..) => &mut manager.editor,
             (None, true, ..) => &mut self.prompt,
             (None, false, Some(panel), ..) => &mut panel.editor,
-            (None, false, None, Some(switcher), ..) => &mut switcher.editor,
-            (None, false, None, None, Some(find), _) => &mut find.editor,
-            (None, false, None, None, None, Some(browser)) if browsing => &mut browser.filter,
-            (None, false, ..) => &mut self.networks[self.active].buffer_mut().input,
+            (None, false, None, Some(switcher), _) => &mut switcher.editor,
+            (None, false, None, None, Some(find)) => &mut find.editor,
+            (None, false, None, None, None) => {
+                let network = &mut self.networks[self.active];
+                match &mut network.browser {
+                    Some(browser) if browsing => &mut browser.filter,
+                    _ => &mut network.state.buffers[network.active].input,
+                }
+            }
         }
     }
 
@@ -1665,6 +1688,7 @@ impl App {
                     }
                     "k" if !welcome => self.open_switcher(),
                     "," if !welcome => self.open_settings(),
+                    "w" if !welcome && self.browsing() => self.close_channels(),
                     "w" if !welcome => {
                         let index = self.networks[self.active].active;
                         self.close_buffer(index);
@@ -1676,7 +1700,7 @@ impl App {
                     }
                     "j" if !welcome => {
                         self.close_find();
-                        self.close_channels();
+                        self.leave_channels();
                         self.close_switcher();
                         self.start_join();
                     }
@@ -1761,7 +1785,7 @@ impl App {
             Key::Named(NamedKey::Tab) if !welcome && self.find.is_some() => return,
             // The channel list: rows are chosen with the arrows and
             // joined with Enter, Tab sorts the other way.
-            Key::Named(NamedKey::Escape) if self.browsing() => return self.close_channels(),
+            Key::Named(NamedKey::Escape) if self.browsing() => return self.leave_channels(),
             Key::Named(NamedKey::Enter) if self.browsing() => return self.join_selected(),
             Key::Named(NamedKey::ArrowUp) if self.browsing() => return self.move_selection(-1),
             Key::Named(NamedKey::ArrowDown) if self.browsing() => return self.move_selection(1),
@@ -1923,8 +1947,13 @@ impl App {
             && rect.contains(point)
         {
             let network = &self.networks[self.active];
-            hover.sidebar = SidebarLayout::new(rect, &network.state.buffers, self.sidebar_scroll)
-                .part_at(point);
+            hover.sidebar = SidebarLayout::new(
+                rect,
+                &network.state.buffers,
+                network.browser.is_some(),
+                self.sidebar_scroll,
+            )
+            .part_at(point);
             if hover.sidebar.is_some() {
                 cursor = CursorIcon::Pointer;
             }
@@ -1939,7 +1968,7 @@ impl App {
             }
         } else if regions.chat.contains(point) && self.browsing() {
             let rows = self.channel_rows();
-            let scroll = self.browser.as_ref().map_or(0.0, |browser| browser.scroll);
+            let scroll = self.browser().map_or(0.0, |browser| browser.scroll);
             let part = TableLayout::new(regions.chat).part_at(point, scroll, rows);
             if part.is_some() {
                 cursor = CursorIcon::Pointer;
@@ -1988,12 +2017,20 @@ impl App {
             && rect.contains(point)
         {
             let network = &self.networks[self.active];
-            let part = SidebarLayout::new(rect, &network.state.buffers, self.sidebar_scroll)
-                .part_at(point);
+            let part = SidebarLayout::new(
+                rect,
+                &network.state.buffers,
+                network.browser.is_some(),
+                self.sidebar_scroll,
+            )
+            .part_at(point);
             match (part, button) {
                 (Some(SidebarPart::Buffer(index)), MouseButton::Left) => {
                     self.activate_buffer(index)
                 }
+                (Some(SidebarPart::Channels), MouseButton::Left) => self.show_channels(),
+                (Some(SidebarPart::Channels), MouseButton::Middle) => self.close_channels(),
+                (Some(SidebarPart::Channels), MouseButton::Right) => self.open_channels_menu(point),
                 (Some(SidebarPart::Buffer(index)), MouseButton::Middle) if index > 0 => {
                     self.close_buffer(index)
                 }
@@ -2019,7 +2056,7 @@ impl App {
         } else if regions.chat.contains(point) && self.browsing() {
             if button == MouseButton::Left {
                 let rows = self.channel_rows();
-                let scroll = self.browser.as_ref().map_or(0.0, |browser| browser.scroll);
+                let scroll = self.browser().map_or(0.0, |browser| browser.scroll);
                 let part = TableLayout::new(regions.chat).part_at(point, scroll, rows);
                 self.table_press(part, double);
             }
@@ -2168,7 +2205,6 @@ impl App {
             smart_filter,
             settings,
             find,
-            browser,
             switcher,
             settings_panel,
             ..
@@ -2314,7 +2350,12 @@ impl App {
                 if (dirty.body || dirty.sidebar)
                     && let Some(rect) = regions.sidebar
                 {
-                    let layout = SidebarLayout::new(rect, &network.state.buffers, *sidebar_scroll);
+                    let layout = SidebarLayout::new(
+                        rect,
+                        &network.state.buffers,
+                        network.browser.is_some(),
+                        *sidebar_scroll,
+                    );
                     *sidebar_scroll = layout.scroll;
                     let status = network.status_line();
                     let sidebar_view = SidebarView {
@@ -2323,6 +2364,7 @@ impl App {
                         buffers: &network.state.buffers,
                         server: &network.config.host,
                         active: network.active,
+                        listing: browsing,
                         hovered: hover.sidebar,
                         focused,
                     };
@@ -2332,10 +2374,10 @@ impl App {
                 if dirty.body || dirty.header {
                     if browsing {
                         let view = HeaderView {
-                            name: "Channels",
+                            name: "Channel list",
                             detail: &channels_detail,
                             topic: None,
-                            placeholder: "Type to filter by name or topic · Enter joins · Tab sorts · Esc closes",
+                            placeholder: "Type to filter by name or topic · Enter joins · Tab sorts · Esc goes back",
                         };
                         header::paint_header(&mut painter, regions.header, &view);
                     } else {
@@ -2345,7 +2387,7 @@ impl App {
                 }
                 if browsing && (dirty.body || dirty.chat || dirty.scrolled) {
                     if let (Some(browser), Some(list)) =
-                        (browser.as_mut(), network.state.channels.as_ref())
+                        (network.browser.as_mut(), network.state.channels.as_ref())
                     {
                         let table = TableView {
                             list,
@@ -2466,7 +2508,7 @@ impl App {
                             focused,
                             note,
                         )
-                    } else if let Some(browser) = browser.as_mut().filter(|_| browsing) {
+                    } else if let Some(browser) = network.browser.as_mut().filter(|_| browsing) {
                         let note = network
                             .state
                             .channels

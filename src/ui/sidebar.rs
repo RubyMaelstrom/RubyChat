@@ -1,7 +1,8 @@
 //! The sidebar: the active network's buffers (DESIGN.md §8.4). A header
 //! names the network above its connection status; then come the server
-//! buffer, CHANNELS and QUERIES, each row with an icon, its name and an
-//! activity badge; `+ JOIN` sits at the foot.
+//! buffer, the channel list while there is one, CHANNELS and QUERIES, each
+//! row with an icon, its name and an activity badge; `+ JOIN` sits at the
+//! foot.
 
 use crate::model::buffer::{Activity, Buffer, BufferKind};
 use crate::render::{Align, Cap, Color, Painter, Path, Point, Rect};
@@ -28,6 +29,8 @@ pub struct Status {
 pub enum SidebarPart {
     /// A buffer, by its index in the network.
     Buffer(usize),
+    /// The channel list `/list` left (DESIGN.md §8.10).
+    Channels,
     Join,
 }
 
@@ -35,6 +38,7 @@ pub enum SidebarPart {
 pub enum SidebarItem {
     Section(&'static str),
     Buffer(usize),
+    Channels,
 }
 
 /// Buffer indices in sidebar order: the server buffer, then channels, then
@@ -63,7 +67,9 @@ pub struct SidebarLayout {
 }
 
 impl SidebarLayout {
-    pub fn new(rect: Rect, buffers: &[Buffer], scroll: f32) -> Self {
+    /// `channels`: whether the network has a channel list, whose row
+    /// follows the server buffer's.
+    pub fn new(rect: Rect, buffers: &[Buffer], channels: bool, scroll: f32) -> Self {
         let header = Rect::new(rect.x, rect.y, rect.width, HEADER_HEIGHT.min(rect.height));
         let footer_height = FOOTER_HEIGHT.min((rect.height - header.height).max(0.0));
         let footer = Rect::new(
@@ -95,6 +101,9 @@ impl SidebarLayout {
                 ));
             }
             entries.push((SidebarItem::Buffer(index), ROW_HEIGHT));
+            if kind == BufferKind::Server && channels {
+                entries.push((SidebarItem::Channels, ROW_HEIGHT));
+            }
         }
         let content: f32 = entries.iter().map(|(_, height)| height).sum::<f32>() + 6.0;
         let max_scroll = (content - list.height).max(0.0);
@@ -128,17 +137,14 @@ impl SidebarLayout {
         }
         self.items.iter().find_map(|(item, rect)| match item {
             SidebarItem::Buffer(index) if rect.contains(point) => Some(SidebarPart::Buffer(*index)),
+            SidebarItem::Channels if rect.contains(point) => Some(SidebarPart::Channels),
             _ => None,
         })
     }
 
-    /// The scroll that brings buffer `index`'s row into view.
-    pub fn reveal(&self, index: usize) -> f32 {
-        let Some((_, row)) = self
-            .items
-            .iter()
-            .find(|(item, _)| *item == SidebarItem::Buffer(index))
-        else {
+    /// The scroll that brings `item`'s row into view.
+    pub fn reveal(&self, item: SidebarItem) -> f32 {
+        let Some((_, row)) = self.items.iter().find(|(each, _)| *each == item) else {
             return self.scroll;
         };
         if row.y < self.list.y {
@@ -160,6 +166,8 @@ pub struct SidebarView<'a> {
     /// The server buffer's row: the server's address.
     pub server: &'a str,
     pub active: usize,
+    /// The channel list shows, rather than buffer `active`.
+    pub listing: bool,
     pub hovered: Option<SidebarPart>,
     pub focused: bool,
 }
@@ -181,6 +189,17 @@ fn paint_icon(painter: &mut Painter<'_>, kind: BufferKind, rect: Rect, color: Co
             painter.stroke_path(&path, 1.2, Cap::Butt, color);
         }
     }
+}
+
+/// The channel list's rows: three rules.
+fn paint_list_icon(painter: &mut Painter<'_>, rect: Rect, color: Color) {
+    let center = rect.center();
+    let mut path = Path::new();
+    for dy in [-3.5, 0.0, 3.5] {
+        path.move_to(center.x - 4.5, center.y + dy);
+        path.line_to(center.x + 4.5, center.y + dy);
+    }
+    painter.stroke_path(&path, 1.2, Cap::Butt, color);
 }
 
 /// A count as the badges show it: 1 to 999, then 999+.
@@ -255,9 +274,33 @@ pub fn paint_sidebar(painter: &mut Painter<'_>, layout: &SidebarLayout, view: &S
                     Align::Start,
                 );
             }
+            SidebarItem::Channels => {
+                let active = view.listing;
+                let hovered = view.hovered == Some(SidebarPart::Channels);
+                if active {
+                    painter.fill_rect(*row, HOVER);
+                    painter.fill_rect(Rect::new(row.x, row.y, 2.0, row.height), accent);
+                } else if hovered {
+                    painter.fill_rect(*row, HOVER.with_alpha(150));
+                    painter.fill_rect(Rect::new(row.x, row.y, 1.0, row.height), CYAN);
+                }
+                paint_list_icon(
+                    painter,
+                    Rect::new(row.x + 12.0, row.y, 16.0, row.height),
+                    if active { CYAN } else { MUTED },
+                );
+                let label_x = row.x + 34.0;
+                painter.label(
+                    "Channel list",
+                    Rect::new(label_x, row.y, row.right() - 12.0 - label_x, row.height),
+                    &theme::chrome(11.5),
+                    if active { TEXT } else { MUTED },
+                    Align::Start,
+                );
+            }
             SidebarItem::Buffer(index) => {
                 let buffer = &view.buffers[index];
-                let active = index == view.active;
+                let active = index == view.active && !view.listing;
                 let hovered = view.hovered == Some(SidebarPart::Buffer(index));
                 if active {
                     painter.fill_rect(*row, HOVER);
@@ -383,7 +426,12 @@ mod tests {
     fn rows_group_channels_before_queries() {
         let buffers = buffers();
         assert_eq!(order(&buffers), [0, 2, 3, 1]);
-        let layout = SidebarLayout::new(Rect::new(0.0, 26.0, SIDEBAR_WIDTH, 600.0), &buffers, 0.0);
+        let layout = SidebarLayout::new(
+            Rect::new(0.0, 26.0, SIDEBAR_WIDTH, 600.0),
+            &buffers,
+            false,
+            0.0,
+        );
         let items: Vec<SidebarItem> = layout.items.iter().map(|(item, _)| *item).collect();
         assert_eq!(
             items,
@@ -407,6 +455,28 @@ mod tests {
     }
 
     #[test]
+    fn the_channel_list_follows_the_server_buffer() {
+        let buffers = buffers();
+        let layout = SidebarLayout::new(
+            Rect::new(0.0, 26.0, SIDEBAR_WIDTH, 600.0),
+            &buffers,
+            true,
+            0.0,
+        );
+        let items: Vec<SidebarItem> = layout.items.iter().map(|(item, _)| *item).collect();
+        assert_eq!(
+            items[..3],
+            [
+                SidebarItem::Buffer(0),
+                SidebarItem::Channels,
+                SidebarItem::Section("CHANNELS"),
+            ]
+        );
+        let row = layout.items[1].1;
+        assert_eq!(layout.part_at(row.center()), Some(SidebarPart::Channels));
+    }
+
+    #[test]
     fn long_lists_scroll_to_reveal_a_row() {
         let mut buffers = buffers();
         for n in 0..40 {
@@ -416,10 +486,15 @@ mod tests {
                 format!("#c{n}"),
             ));
         }
-        let layout = SidebarLayout::new(Rect::new(0.0, 26.0, SIDEBAR_WIDTH, 400.0), &buffers, 0.0);
+        let layout = SidebarLayout::new(
+            Rect::new(0.0, 26.0, SIDEBAR_WIDTH, 400.0),
+            &buffers,
+            false,
+            0.0,
+        );
         assert!(layout.max_scroll > 0.0);
-        let scroll = layout.reveal(43);
-        let revealed = SidebarLayout::new(layout.rect, &buffers, scroll);
+        let scroll = layout.reveal(SidebarItem::Buffer(43));
+        let revealed = SidebarLayout::new(layout.rect, &buffers, false, scroll);
         let row = revealed
             .items
             .iter()
@@ -439,7 +514,7 @@ mod tests {
             "hi",
         ));
         let rect = Rect::new(10.0, 20.0, SIDEBAR_WIDTH, 300.0);
-        let layout = SidebarLayout::new(rect, &buffers, 0.0);
+        let layout = SidebarLayout::new(rect, &buffers, true, 0.0);
         let mut canvas = Canvas::new(300, 340);
         let mut text = TextSystem::new();
         let mut painter = Painter::new(&mut canvas, &mut text, 1.0);
@@ -453,6 +528,7 @@ mod tests {
             buffers: &buffers,
             server: "irc.libera.chat",
             active: 0,
+            listing: true,
             hovered: Some(SidebarPart::Buffer(3)),
             focused: true,
         };

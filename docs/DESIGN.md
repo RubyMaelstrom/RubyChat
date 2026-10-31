@@ -476,7 +476,8 @@ decorative traces, and window buttons with the pink close hover.
 The active network's buffers. A header names the network in small caps above
 a status line (`● TLS · 38 ms`, `◌ RECONNECTING IN 8 S`, a broken lock when
 unverified). Then come the server buffer (`>_`, trust-desktop's terminal
-glyph), CHANNELS and QUERIES.
+glyph), the channel list while `/list` has left one (three rules), CHANNELS
+and QUERIES.
 
 Each row has an icon, the name (ellipsized) and a badge: a pink count for
 highlights, a cyan count for unread messages, a dim dot for other activity.
@@ -609,9 +610,17 @@ As built in M6:
   column titles that sort by them, users first by default. Channels show as
   they stream in; the input row filters by name or topic (`FILTER›`); Up,
   Down, Page Up and Page Down select, Enter or a double click joins and
-  shows the channel, Tab sorts the other way, and Esc closes it. The header
-  counts channels and says when the list is loading or sorting. At most
-  200,000 channels are kept; more are counted.
+  shows the channel, and Tab sorts the other way. The header counts
+  channels and says when the list is loading or sorting. At most 200,000
+  channels are kept; more are counted.
+- The list keeps a sidebar row, after the server buffer's, until it's
+  closed: Esc, joining from it or choosing another row goes back to
+  buffers, and the row (or Alt+Up and Alt+Down) shows the list again as it
+  was left, filter, order and selection included, without asking the
+  server. A middle click, the row's menu or Ctrl+W while it shows closes
+  it and frees the list; the menu's Refresh asks again with the same
+  arguments, as `/list` does. Each network keeps its own, and a buffer
+  under the list isn't counted as read while the list shows.
 
 As built in M7:
 
@@ -1302,6 +1311,12 @@ Settled while building M7:
     on; nothing for Windows is claimed to work until then.
 37. **Releases build with thin LTO, one codegen unit and no symbols**, and
     ship as an archive with its own installer; nothing installs itself.
+
+Settled after M7:
+
+38. **The channel list is a sidebar row** that lasts until it's closed, as
+    the user asked: joining a channel from it, or looking at a buffer, no
+    longer means asking the server for the whole list again.
 
 ## 18. Standards
 

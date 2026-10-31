@@ -143,13 +143,14 @@ fn paint_budgets() {
     // Switching to the buffer paints everything below the strip.
     let switch = measure(|| {
         let mut painter = Painter::new(&mut canvas, &mut text, 1.0);
-        let layout = SidebarLayout::new(sidebar, &state.buffers, 0.0);
+        let layout = SidebarLayout::new(sidebar, &state.buffers, false, 0.0);
         let view = SidebarView {
             title: "Libera.Chat",
             status: &status,
             buffers: &state.buffers,
             server: "irc.libera.chat",
             active: index,
+            listing: false,
             hovered: None,
             focused: true,
         };

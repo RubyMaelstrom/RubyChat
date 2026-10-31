@@ -20,6 +20,10 @@ pub(super) enum MenuAction {
     Query(String),
     MarkRead(usize),
     Close(usize),
+    /// Asks for the channel list again.
+    RefreshChannels,
+    /// Closes the channel list's sidebar row.
+    CloseChannels,
     /// Opens the editor on this saved network.
     EditSaved(String),
     /// Opens the editor to save the shown network.
@@ -206,6 +210,8 @@ impl App {
                 }
             }
             MenuAction::Close(index) => self.close_buffer(index),
+            MenuAction::RefreshChannels => self.refresh_channels(),
+            MenuAction::CloseChannels => self.close_channels(),
             MenuAction::EditSaved(name) => {
                 if let Some(index) = self
                     .saved
@@ -310,6 +316,22 @@ impl App {
             }
         };
         self.open_menu(badge, title, menu, anchor);
+    }
+
+    /// The menu for the channel list's sidebar row.
+    pub(super) fn open_channels_menu(&mut self, anchor: Point) {
+        let Some(network) = self.networks.get(self.active) else {
+            return;
+        };
+        let mut menu = Builder::default();
+        let refresh = MenuItem::new("Refresh", MenuIcon::Reload).enabled(network.registered());
+        menu.add(refresh, MenuAction::RefreshChannels);
+        let close = MenuItem::new("Close", MenuIcon::Leave)
+            .caution()
+            .shortcut("Ctrl+W");
+        menu.add(close, MenuAction::CloseChannels);
+        let title = network.title.clone();
+        self.open_menu("LIST", title, menu, anchor);
     }
 
     /// The menu for a nick, from the nick list or the chat view.

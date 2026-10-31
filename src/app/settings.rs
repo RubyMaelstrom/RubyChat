@@ -98,7 +98,6 @@ impl App {
         }
         self.close_menu();
         self.close_find();
-        self.close_channels();
         self.close_switcher();
         self.settings_panel = Some(SettingsPanel::default());
         self.mark_under_settings();
