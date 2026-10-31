@@ -705,6 +705,14 @@ impl App {
             .with_inner_size(LogicalSize::new(width, height))
             .with_maximized(maximized)
             .with_min_inner_size(LogicalSize::new(MINIMUM_SIZE.0, MINIMUM_SIZE.1));
+        #[cfg(windows)]
+        {
+            use winit::platform::windows::WindowAttributesExtWindows;
+            // The shadow other windows have, though the title bar is ours.
+            attributes = attributes
+                .with_undecorated_shadow(true)
+                .with_class_name("RubyChat");
+        }
         #[cfg(all(unix, not(target_vendor = "apple")))]
         {
             use winit::platform::startup_notify::WindowAttributesExtStartupNotify;
@@ -730,6 +738,15 @@ impl App {
         let (rgba, size) = self.logo.icon(64);
         if let Ok(icon) = winit::window::Icon::from_rgba(rgba, size, size) {
             window.set_window_icon(Some(icon));
+        }
+        // The taskbar's and Alt+Tab's: rubychat.exe's own icon, at the size
+        // Windows asks for.
+        #[cfg(windows)]
+        {
+            use winit::platform::windows::{IconExtWindows, WindowExtWindows};
+            if let Ok(icon) = winit::window::Icon::from_resource(1, None) {
+                window.set_taskbar_icon(Some(icon));
+            }
         }
         let presenter = Presenter::new(window.clone())?;
         let size = window.inner_size();
@@ -1883,6 +1900,8 @@ impl App {
         if let Some(clipboard) = &mut self.clipboard {
             clipboard.copy(text.clone());
         }
+        #[cfg(windows)]
+        crate::platform::win32::clipboard::copy(text.clone());
         self.copied = text;
     }
 
@@ -1896,6 +1915,18 @@ impl App {
             let sender = self.pasted.0.clone();
             let wake = (self.waker)();
             let started = clipboard.paste(move |text| {
+                let _ = sender.send(text);
+                wake();
+            });
+            if started {
+                return;
+            }
+        }
+        #[cfg(windows)]
+        {
+            let sender = self.pasted.0.clone();
+            let wake = (self.waker)();
+            let started = crate::platform::win32::clipboard::paste(move |text| {
                 let _ = sender.send(text);
                 wake();
             });

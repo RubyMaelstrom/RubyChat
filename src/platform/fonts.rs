@@ -52,6 +52,26 @@ pub struct Fonts {
     commands: mpsc::Sender<FontCommand>,
 }
 
+/// The user's locale where the environment doesn't say, as `ll_CC`:
+/// Windows names it `ll-CC` (GetUserDefaultLocaleName).
+#[cfg(windows)]
+fn system_language() -> String {
+    use windows_sys::Win32::Globalization::GetUserDefaultLocaleName;
+    // LOCALE_NAME_MAX_LENGTH.
+    let mut name = [0u16; 85];
+    // SAFETY: the buffer and its length agree, and it outlives the call.
+    let length = unsafe { GetUserDefaultLocaleName(name.as_mut_ptr(), name.len() as i32) };
+    if length <= 1 {
+        return String::new();
+    }
+    String::from_utf16_lossy(&name[..length as usize - 1]).replace('-', "_")
+}
+
+#[cfg(not(windows))]
+fn system_language() -> String {
+    String::new()
+}
+
 impl Fonts {
     /// Starts the worker: it indexes the fonts, sends the index, then
     /// loads faces as asked.
@@ -63,7 +83,7 @@ impl Fonts {
                 let language = std::env::var("LC_ALL")
                     .or_else(|_| std::env::var("LC_CTYPE"))
                     .or_else(|_| std::env::var("LANG"))
-                    .unwrap_or_default();
+                    .unwrap_or_else(|_| system_language());
                 let cache = super::paths::cache_dir().map(|dir| dir.join(CACHE_FILE));
                 let mut index = build_index(&super::paths::font_dirs(), cache.as_deref());
                 index.preferred = preferred_families(&language);

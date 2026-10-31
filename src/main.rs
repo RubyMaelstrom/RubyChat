@@ -1,3 +1,6 @@
+// A window, not a console program: Explorer opens no console beside it.
+#![cfg_attr(windows, windows_subsystem = "windows")]
+
 use std::process::ExitCode;
 
 use rubychat::app::{self, Options};
@@ -12,11 +15,14 @@ irc:// or port 6667. While RubyChat runs, a later launch hands its servers
 to it and shows its window.
 
 Options:
-      --show      Show the running RubyChat's window
-      --tray      Start in the tray, without a window
-      --demo      Open placeholder networks to try the window chrome
-  -h, --help      Print this help
-  -V, --version   Print the version
+      --show        Show the running RubyChat's window
+      --tray        Start in the tray, without a window
+      --demo        Open placeholder networks to try the window chrome
+      --register    Windows: open irc:// and ircs:// links in this RubyChat
+      --unregister  Windows: stop opening them here
+  -h, --help        Print this help
+  -V, --version     Print the version
+      --            Treat what follows as servers, even if it starts with -
 
 Environment:
   RUBYCHAT_TRACE            Log each frame's timings and every event-loop wake
@@ -29,9 +35,18 @@ fn main() -> ExitCode {
         launched: Some(std::time::Instant::now()),
         ..Options::default()
     };
+    #[cfg(windows)]
+    attach_console();
     let mut show = false;
+    let mut servers_only = false;
     for argument in std::env::args().skip(1) {
+        if servers_only {
+            options.connect.push(argument);
+            continue;
+        }
         match argument.as_str() {
+            "--" => servers_only = true,
+            "--register" | "--unregister" => return register(argument == "--register"),
             "--demo" => options.demo = true,
             "--show" => show = true,
             "--tray" => options.tray = true,
@@ -71,6 +86,51 @@ fn main() -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+/// `--register` and `--unregister`: irc:// links on Windows.
+#[cfg(windows)]
+fn register(register: bool) -> ExitCode {
+    use rubychat::platform::win32::register;
+    let result = if register {
+        std::env::current_exe()
+            .map_err(|error| format!("can't locate RubyChat's executable: {error}"))
+            .and_then(|executable| register::register(&executable))
+    } else {
+        register::unregister()
+    };
+    match result {
+        Ok(()) if register => {
+            println!("irc:// and ircs:// links now open in this RubyChat.");
+            ExitCode::SUCCESS
+        }
+        Ok(()) => {
+            println!("irc:// and ircs:// links no longer open in RubyChat.");
+            ExitCode::SUCCESS
+        }
+        Err(error) => {
+            eprintln!("rubychat: {error}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+#[cfg(not(windows))]
+fn register(_: bool) -> ExitCode {
+    eprintln!(
+        "rubychat: --register and --unregister are for Windows; on Linux, \
+         rubychat.desktop registers irc:// links"
+    );
+    ExitCode::from(2)
+}
+
+/// Started from a console, RubyChat writes there (help, the version,
+/// errors and traces); started from Explorer there is none to attach.
+#[cfg(windows)]
+fn attach_console() {
+    use windows_sys::Win32::System::Console::{ATTACH_PARENT_PROCESS, AttachConsole};
+    // SAFETY: a plain call, before any output.
+    unsafe { AttachConsole(ATTACH_PARENT_PROCESS) };
 }
 
 /// The token whatever launched RubyChat left for its window

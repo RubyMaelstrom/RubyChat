@@ -13,3 +13,5 @@ pub mod mmap;
 pub mod open;
 pub mod paths;
 pub mod time;
+#[cfg(windows)]
+pub mod win32;

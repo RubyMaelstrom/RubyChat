@@ -18,8 +18,11 @@ standard replies, STS, the smart filter, ignores), M6 (chat logs,
 backlog paging, chathistory with event playback, read markers, search, the
 channel list) and M7 (the font index and fallback, color emoji, IME
 composition, the quick switcher, settings, the release profile and
-packaging) are implemented on Linux; DESIGN.md §16 lists what each left
-for later, the Windows build first. DESIGN.md §17 records the settled
+packaging) are implemented on Linux. The Windows build followed: the
+notification-area tray and balloons, the clipboard, the named-pipe single
+instance, `--register` for irc:// links, local time and the exe's
+resources, cross-compiled and tried under Wine (no Windows machine yet).
+DESIGN.md §16 lists what each left for later; §17 records the settled
 decisions.
 
 ## Binding rules
@@ -64,6 +67,27 @@ cargo clippy --all-targets
 cargo fmt --check
 cargo build --release
 ```
+
+The Windows build is cross-compiled on `ruby@zombie` (x86-64 CachyOS,
+login shell fish: send it `bash -s` scripts), which has rustup's
+`x86_64-pc-windows-msvc` target, cargo-xwin, Clang/LLD and Wine. Sync a
+checkout there (`rsync -a --exclude target --exclude scratch --exclude
+dist --exclude .git ./ ruby@zombie:.cache/rubychat-dev/`), then:
+
+```sh
+cargo xwin clippy --locked --target x86_64-pc-windows-msvc --all-targets
+WINEPREFIX=$HOME/.cache/rubychat-wine WINEDEBUG=-all \
+CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUNNER=wine \
+cargo xwin test --locked --target x86_64-pc-windows-msvc --lib
+```
+
+Use that throwaway prefix, never `~/.wine`, and keep it outside the
+checkout (its `z:` drive is `/`, which cargo would walk). zombie has no
+display: the prefix's `HKCU\Software\Wine\Drivers` `Graphics=null` lets
+Wine create windows anyway (after `wine reg add`, let `wineserver -w`
+save it). `--ignored clipboard register the_tray_answers` adds the
+Windows tests that change the machine's state. `wineserver -k` afterwards,
+or ssh waits for it.
 
 Run focused tests while iterating, then the full set before handoff.
 Performance benchmarks are `#[ignore]`d; run them explicitly after touching
@@ -137,9 +161,15 @@ the user's explicit approval.
   indexes this machine's fonts into a scratch cache and times it; `--demo`
   shows a line of CJK, symbols and emoji for checking fallback by eye.
 - `tools/package.sh` builds the release binary and writes
-  `dist/rubychat-<version>-<arch>-linux.tar.gz` (ignored by git) with the
-  desktop entry, icons, licenses and an `install.sh` taking a prefix. Run
-  that installer only into scratch prefixes unless the user asks.
+  `dist/rubychat-linux-<x86-64|arm64>.tar.gz` (ignored by git), TRust's
+  names, with the program at its root beside the desktop entry, icons,
+  licenses and an `install.sh` taking a prefix. Run that installer only
+  into scratch prefixes unless the user asks. `tools/package-windows.sh`
+  (on zombie) writes `dist/rubychat-windows-x86-64.zip`: rubychat.exe and
+  the licenses.
+- On Windows, `RUBYCHAT_EXIT_AFTER` and `RUBYCHAT_SNAPSHOT` work under Wine
+  as on Linux (give the snapshot a `Z:\...` path); the scripted servers in
+  `scratch/fake-irc/` run on zombie too.
 
 ## Conventions
 

@@ -1,8 +1,7 @@
 # RubyChat design
 
 Draft 2 · 31 October 2026 · decisions settled (§17); milestones M0 to M7
-are implemented on Linux; the Windows build waits for a Windows toolchain
-(§16).
+are implemented on Linux, and the Windows build since (§16).
 
 RubyChat is a desktop IRC client written in Rust. Its overriding goal is that
 nothing on the client side ever makes you wait. It draws its own interface in
@@ -87,10 +86,13 @@ make 190; AccessKit adds 71; arboard with Wayland data-control adds 18; zbus
 on its own is 67.
 
 Used directly because winit or rustls already brings them, with the same
-features: libc (Unix), windows-sys (Windows), wayland-client and x11rb
-(clipboard), wayland-protocols (xdg-activation, to raise the window), and
-aws-lc-rs (SCRAM's SHA-256, HMAC and PBKDF2, randomness, certificate
-fingerprints, and the single-instance key).
+features: libc (Unix), wayland-client and x11rb (clipboard),
+wayland-protocols (xdg-activation, to raise the window), and aws-lc-rs
+(SCRAM's SHA-256, HMAC and PBKDF2, randomness, certificate fingerprints,
+and the single-instance key). windows-sys 0.61 (Windows) comes with mio and
+softbuffer; RubyChat turns on more of its modules (the shell, clipboard,
+pipes, security, registry, time, console), which adds bindings, not
+crates.
 
 Hand-built: the IRC parser, serializer and session state machines; Happy
 Eyeballs connection racing; SOCKS5; SASL PLAIN, SCRAM-SHA-256 and EXTERNAL;
@@ -801,7 +803,7 @@ as they're measured.
 | Session: window, order, open buffers, read positions | `$XDG_STATE_HOME/rubychat/session.toml` | `%LOCALAPPDATA%\RubyChat\` |
 | Chat logs | `$XDG_DATA_HOME/rubychat/logs/<network>/<buffer>/<YYYY-MM-DD>.log` | `%LOCALAPPDATA%\RubyChat\logs\` |
 | Font index | `$XDG_CACHE_HOME/rubychat/` | `%LOCALAPPDATA%\RubyChat\cache\` |
-| Single-instance socket and lock | `$XDG_RUNTIME_DIR/rubychat/` | A named pipe |
+| Single-instance socket and lock | `$XDG_RUNTIME_DIR/rubychat/` | A named pipe; the lock in `%LOCALAPPDATA%\RubyChat\` |
 
 - Format: a strict TOML subset (tables, arrays of tables, strings, integers,
   booleans, arrays), parsed by hand with line and column errors. The store
@@ -889,8 +891,8 @@ require = true
   RubyChat's D-Bus client. It re-registers when the panel restarts (watching
   `NameOwnerChanged`), and if the tray disappears while the window is hidden,
   the window comes back.
-- Windows: `Shell_NotifyIconW`, a message-only window and `TrackPopupMenuEx`
-  on the desktop thread.
+- Windows: `Shell_NotifyIconW`, a hidden window and `TrackPopupMenuEx` on
+  the desktop thread.
 - The icon, a faceted ruby with neon edges, is drawn in code and pre-rendered
   to ARGB pixmaps from 16 to 64 px.
 
@@ -913,6 +915,17 @@ it sends one, else as a new window) and opens a closed one. The menu at `/MenuBa
 RubyChat, Mark all read (disabled with nothing unread), Away (a checkmark;
 servers confirm with 305 and 306) and Quit RubyChat. Not yet: limiting the
 icon to while the window is closed.
+
+As built on Windows (`platform/desktop/win32.rs`; `Shell_NotifyIconW`,
+`NOTIFYICONDATAW`, `TrackPopupMenuEx`): the desktop thread owns a hidden
+top-level window rather than a message-only one, which could neither take
+the foreground the menu needs to close on a click elsewhere nor hear
+`TaskbarCreated`, on which the icon is added again. The icon is the same
+drawing at `SM_CXSMICON`, with `NOTIFYICON_VERSION_4`: a click or Enter
+(`NIN_SELECT`, `NIN_KEYSELECT`) shows or hides the window, and
+`WM_CONTEXTMENU` opens the same menu at the icon. Commands wake the thread
+with a posted message; a call that re-enters the window procedure while it
+works has its own messages posted again.
 
 ### 12.2 D-Bus
 
@@ -941,7 +954,11 @@ hidden, coalesced per buffer, and each buffer can be muted. Clicking a
 notification opens that buffer, passing on the notification server's
 xdg-activation token when it sends one, so the compositor lets the window take
 focus. An open but unfocused window is also marked urgent
-(`request_user_attention`). Windows uses the tray's balloon notifications.
+(`request_user_attention`). Windows uses the tray's balloon notifications,
+which Windows 10 and 11 show as toasts: the same newest three lines and
+count per buffer, titled the same, with the logo as the balloon's icon;
+clicking one (`NIN_BALLOONUSERCLICK`) opens the buffer of the last shown,
+and seeing that buffer withdraws it.
 
 As built (Desktop Notifications Specification): one notification per buffer,
 titled `#rust · Libera.Chat`, which later lines replace (`replaces_id`) to
@@ -979,7 +996,23 @@ channel or opens its query there instead of connecting again, at startup
 too. `assets/desktop/` holds `rubychat.desktop` (Desktop Entry 1.5, `Exec=rubychat
 %U`), `rubychat-autostart.desktop` (`--tray`) and hicolor icons from 16 to
 256 px made by `tools/gen_icons.py`; installing them is left to packaging.
-Not yet: the named pipe and tray on Windows (M7).
+
+On Windows the socket is `\\.\pipe\rubychat-<key>`, the key taking the
+session for the display since every session sees the same pipes, and the
+lock is `instance-<key>.lock` in `%LOCALAPPDATA%\RubyChat` (Wine doesn't
+hold to `FILE_FLAG_FIRST_PIPE_INSTANCE`, so the lock decides). The pipe's
+security descriptor admits this user alone, where the default would let
+everyone read, and it rejects remote clients. Each launch is answered on a
+short-lived thread, four at most, since pipes have no timeouts; a launch
+calls `AllowSetForegroundWindow` first, so the running window may come
+forward, which it then does without a token. `rubychat --register` points
+irc:// and ircs:// at this executable under `HKEY_CURRENT_USER\Software\Classes`
+(`"rubychat.exe" -- "%1"`: `--` ends options, so a link with a quote in it
+can't pass one), and `--unregister` removes what opens a RubyChat; nothing
+registers itself. rubychat.exe carries its icon (`assets/desktop/rubychat.ico`,
+made by `tools/gen_icons.py`), version information and a manifest
+(Windows 10 and later, DPI per monitor, UTF-8), which `build.rs` writes as
+a .res for the linker; the window's taskbar icon is that icon.
 
 ### 12.5 Clipboard
 
@@ -991,9 +1024,16 @@ included. A keyboard object of its own supplies the input serial that
 legacy text types; pasting asks for the best text type on offer. Data moves
 through pipes on short-lived threads, nonblocking with a 3-second stall
 limit, and a paste reads at most 1 MiB. The clipboard is dropped in
-`exiting`, while the connection it shares is still open. X11 and Windows
-keep an in-app clipboard until their selection code lands (M7);
-the primary selection (middle click) is not supported.
+`exiting`, while the connection it shares is still open. X11 keeps an
+in-app clipboard until its selection code lands; the primary selection
+(middle click) is not supported.
+
+Windows (`platform/win32/clipboard.rs`): `CF_UNICODETEXT`, with CR LF line
+ends, on a thread of its own whose message-only window owns what RubyChat
+copies (`SetClipboardData` fails with no owner) and whose message loop
+answers what the system sends an owner. A paste reads at most 1 MiB there
+and comes back through the same channel as on Wayland, so an application
+slow to render what it copied stalls that thread, never the UI.
 
 ## 13. Security and robustness
 
@@ -1163,11 +1203,26 @@ real window, CJK and symbols came from the installed fallbacks and emoji
 in color from Noto Color Emoji. The release profile (thin LTO, one code
 generation unit, no symbols) makes an 8.7 MB binary, and `tools/package.sh`
 packs it with the desktop entry, icons, licenses and an `install.sh` for a
-prefix of your choosing. Not yet: the Windows build (no Windows toolchain
-or machine here; Windows paths and file reading are written but neither
-compiled nor run), the multi-line input bar, choosing faces and sizes in
-the settings, bidi, COLR emoji, and a settings surface for networks'
-CTCP, part and quit messages beyond the Server Manager's.
+prefix of your choosing. Not yet: the multi-line input bar, choosing
+faces and sizes in the settings, bidi, COLR emoji, and a settings surface
+for networks' CTCP, part and quit messages beyond the Server Manager's.
+
+After M7, at the user's request: the channel list keeps a sidebar row
+(§8.10), and the Windows build. It is cross-compiled for x86-64 with
+cargo-xwin and the MSVC target on an x86-64 Linux machine, and checked
+under Wine there with its null graphics driver: every unit test passes,
+and the clipboard, `--register` and tray tests (opt-in, since they change
+the machine's state) pass too; the real window connects to a scripted
+server, a second launch hands an irc:// link over through the pipe, and a
+snapshot shows the window as on Linux, in local time. Windows has the
+tray and balloon notifications, the clipboard, the single instance and
+links, local time (`SystemTimeToTzSpecificLocalTime`), the locale's
+fallback faces (Segoe UI Emoji and Symbol, Yu Gothic, Malgun Gothic,
+Microsoft YaHei or JhengHei after the Linux ones), `ShellExecuteW` for
+links, the window's shadow, and no console window (a launch from one
+still writes there). Emoji there are Segoe UI Emoji's outlines, uncolored,
+until COLR lands. Not yet: a Start menu entry, starting at login, and a
+real Windows machine's word on all of it.
 
 M6's scope is implemented and tested. On the local ergo, a channel's
 history came back on joining with its topic change and an earlier join as
@@ -1264,6 +1319,7 @@ Settled while building M4:
     than connecting a second time; so do the first launch's own addresses.
 20. **The Windows tray waits for the Windows build** (M7), since nothing
     for Windows is built or tested yet; until then closing quits there.
+    (Built since; see 39.)
 
 Settled while building M5:
 
@@ -1308,7 +1364,8 @@ Settled while building M7:
 35. **Settings are a file, a command and a panel**, applied as they change;
     choosing faces and sizes waits for a layout that follows them.
 36. **The Windows build waits** for a Windows toolchain and machine to test
-    on; nothing for Windows is claimed to work until then.
+    on; nothing for Windows is claimed to work until then. (Built since,
+    without a Windows machine; see 39.)
 37. **Releases build with thin LTO, one codegen unit and no symbols**, and
     ship as an archive with its own installer; nothing installs itself.
 
@@ -1317,6 +1374,13 @@ Settled after M7:
 38. **The channel list is a sidebar row** that lasts until it's closed, as
     the user asked: joining a channel from it, or looking at a buffer, no
     longer means asking the server for the whole list again.
+39. **Windows is built on Linux and tried under Wine**: cargo-xwin and the
+    MSVC target, as TRust's Windows builds are, on an x86-64 machine with
+    Wine's null graphics driver, until a Windows machine is at hand.
+40. **Releases follow TRust's**: `rubychat-linux-x86-64.tar.gz`,
+    `rubychat-linux-arm64.tar.gz` and `rubychat-windows-x86-64.zip`, with
+    the program at the archive's root; the Linux archives keep the
+    desktop entry, icons and `install.sh`, and the zip the licenses.
 
 ## 18. Standards
 
@@ -1349,8 +1413,14 @@ interface XML (`kde-status-notifier-item-xml-*`), libdbusmenu's
 (`notification-spec-*`), the Desktop Entry, MIME applications and Autostart
 specifications (`desktop-entry-spec-*`, `mime-apps-spec-*`,
 `autostart-spec-*`), and the `xdg_activation_v1` protocol
-(`xdg-activation-v1-*`). Windows' `Shell_NotifyIconW` documentation is
-still to be added, before M7 builds the Windows tray.
+(`xdg-activation-v1-*`). Added on 31 October 2026: the Icon Theme
+Specification (`icon-theme-spec-*`), for installing the icons, and
+Microsoft's Win32 pages for the Windows build (`win32-*`): the notification
+area (`Shell_NotifyIconW`, `NOTIFYICONDATAW`), `TrackPopupMenuEx` and the
+foreground, the clipboard, named pipes and their security,
+`SystemTimeToTzSpecificLocalTime`, `ShellExecuteW` and URI schemes, the
+resource file formats (`RESOURCEHEADER`, icon groups, `VS_VERSIONINFO`)
+and application manifests.
 
 ## 19. Alternatives considered
 

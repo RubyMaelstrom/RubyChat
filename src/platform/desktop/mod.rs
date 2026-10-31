@@ -1,8 +1,9 @@
 //! The desktop thread (DESIGN.md §5.1, §12): the tray icon and its menu,
 //! and notifications. The app sends it commands without waiting and hears
 //! back through a sink, as from the network thread. On Linux and the BSDs
-//! it speaks to the session bus (`service`); elsewhere there is no tray
-//! yet, and closing the window quits.
+//! it speaks to the session bus (`service`); on Windows it keeps an icon in
+//! the notification area (`win32`); elsewhere there is no tray, and closing
+//! the window quits.
 
 #[cfg(all(unix, not(target_vendor = "apple")))]
 mod notify;
@@ -10,13 +11,19 @@ mod notify;
 mod service;
 #[cfg(all(unix, not(target_vendor = "apple")))]
 mod tray;
+#[cfg(windows)]
+mod win32;
 
 use std::io;
-use std::sync::{Arc, mpsc};
+#[cfg(not(windows))]
+use std::sync::Arc;
+use std::sync::mpsc;
 use std::thread::JoinHandle;
 
+#[cfg(not(windows))]
 use mio::{Poll, Token, Waker};
 
+#[cfg(not(windows))]
 const WAKER: Token = Token(0);
 /// Commands waiting for the thread, at most; past this they're dropped.
 const COMMANDS: usize = 1024;
@@ -96,13 +103,37 @@ pub enum MenuAction {
 
 pub struct Desktop {
     commands: mpsc::SyncSender<DesktopCommand>,
+    #[cfg(not(windows))]
     waker: Arc<Waker>,
+    #[cfg(windows)]
+    waker: win32::Waker,
     thread: Option<JoinHandle<()>>,
 }
 
 impl Desktop {
     /// Starts the desktop thread. `sink` receives its events on that
     /// thread; it should hand them to the UI and wake it.
+    #[cfg(windows)]
+    pub fn spawn(
+        sink: impl FnMut(DesktopEvent) + Send + 'static,
+        artwork: Artwork,
+    ) -> io::Result<Self> {
+        let (commands, receiver) = mpsc::sync_channel(COMMANDS);
+        let waker = win32::Waker::default();
+        let window = waker.clone();
+        let thread = std::thread::Builder::new()
+            .name(String::from("rubychat-desktop"))
+            .spawn(move || win32::run(receiver, Box::new(sink), artwork, window))?;
+        Ok(Self {
+            commands,
+            waker,
+            thread: Some(thread),
+        })
+    }
+
+    /// Starts the desktop thread. `sink` receives its events on that
+    /// thread; it should hand them to the UI and wake it.
+    #[cfg(not(windows))]
     pub fn spawn(
         sink: impl FnMut(DesktopEvent) + Send + 'static,
         artwork: Artwork,
@@ -131,9 +162,16 @@ impl Desktop {
     pub fn send(&self, command: DesktopCommand) -> bool {
         let sent = self.commands.try_send(command).is_ok();
         if sent {
-            let _ = self.waker.wake();
+            self.wake();
         }
         sent
+    }
+
+    fn wake(&self) {
+        #[cfg(not(windows))]
+        let _ = self.waker.wake();
+        #[cfg(windows)]
+        self.waker.wake();
     }
 }
 
@@ -141,7 +179,7 @@ impl Drop for Desktop {
     /// Withdraws RubyChat's notifications and waits for the thread.
     fn drop(&mut self) {
         if self.commands.send(DesktopCommand::Shutdown).is_ok() {
-            let _ = self.waker.wake();
+            self.wake();
         }
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();

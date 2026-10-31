@@ -112,14 +112,14 @@ impl FontIndex {
 
 /// Families tried first: the Nerd Font build of the chat face for its
 /// icons, color emoji, the CJK face for the locale's region, then common
-/// broad faces.
+/// broad faces; Windows' own come after, for a system without these.
 pub fn preferred_families(language: &str) -> Vec<String> {
-    let cjk = match language.split(['.', '@']).next().unwrap_or("") {
-        lang if lang.starts_with("ja") => "Noto Sans CJK JP",
-        lang if lang.starts_with("ko") => "Noto Sans CJK KR",
-        "zh_TW" => "Noto Sans CJK TC",
-        "zh_HK" | "zh_MO" => "Noto Sans CJK HK",
-        _ => "Noto Sans CJK SC",
+    let (cjk, windows_cjk) = match language.split(['.', '@']).next().unwrap_or("") {
+        lang if lang.starts_with("ja") => ("Noto Sans CJK JP", "Yu Gothic"),
+        lang if lang.starts_with("ko") => ("Noto Sans CJK KR", "Malgun Gothic"),
+        "zh_TW" => ("Noto Sans CJK TC", "Microsoft JhengHei"),
+        "zh_HK" | "zh_MO" => ("Noto Sans CJK HK", "Microsoft JhengHei"),
+        _ => ("Noto Sans CJK SC", "Microsoft YaHei"),
     };
     [
         "JetBrainsMono Nerd Font",
@@ -130,6 +130,10 @@ pub fn preferred_families(language: &str) -> Vec<String> {
         "Noto Sans",
         "Noto Sans Symbols",
         "Noto Sans Symbols 2",
+        "Segoe UI Emoji",
+        windows_cjk,
+        "Segoe UI Symbol",
+        "Segoe UI",
     ]
     .into_iter()
     .map(String::from)

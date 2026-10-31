@@ -45,6 +45,31 @@ winit = { version = "0.30.13", default-features = false, features = ["x11", "way
 # Local time (localtime_r), and the clipboard's pipes. Already in winit's graph.
 libc = "0.2.191"
 
+[target.'cfg(windows)'.dependencies]
+# The tray and its notifications, the clipboard, the single-instance pipe,
+# local time, links, the locale and irc:// registration. Already in the
+# graph through mio and softbuffer; these features add only bindings.
+windows-sys = { version = "0.61.2", features = [
+    "Win32_Foundation",
+    "Win32_Globalization",
+    "Win32_Graphics_Gdi",
+    "Win32_Security",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Com",
+    "Win32_System_Console",
+    "Win32_System_DataExchange",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Memory",
+    "Win32_System_Ole",
+    "Win32_System_Pipes",
+    "Win32_System_Registry",
+    "Win32_System_RemoteDesktop",
+    "Win32_System_Threading",
+    "Win32_System_Time",
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
+] }
+
 [target.'cfg(all(unix, not(target_vendor = "apple")))'.dependencies]
 # The Wayland clipboard on winit's connection. Already in winit's graph, with
 # the same features.

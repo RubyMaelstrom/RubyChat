@@ -123,9 +123,13 @@ impl App {
     }
 
     /// Asks for the window: a closed one opens on the next wake, and an
-    /// open one is raised with `token`, if there is one.
+    /// open one is raised with `token`, if there is one. Windows has no
+    /// tokens: the launch or click that asked has already let RubyChat
+    /// take the foreground, so an open window is always raised there.
     pub(super) fn show_window(&mut self, token: Option<String>) {
         self.shell.hidden = false;
+        #[cfg(windows)]
+        let token = token.or_else(|| Some(String::new()));
         if token.is_some() {
             self.shell.token = token;
         }
@@ -167,6 +171,10 @@ impl App {
             }
         }
         let _ = token;
+        // Windows doesn't raise a minimized window.
+        if view.window.is_minimized() == Some(true) {
+            view.window.set_minimized(false);
+        }
         view.window.focus_window();
     }
 
@@ -182,7 +190,9 @@ impl App {
         };
         match self.view.as_ref().map(focused) {
             Some(true) => self.hide_window(),
-            Some(false) if token.is_none() => {
+            // Wayland raises nothing without a token: a new window comes up
+            // instead. Elsewhere the old one is raised.
+            Some(false) if token.is_none() && cfg!(not(windows)) => {
                 self.hide_window();
                 self.show_window(None);
             }

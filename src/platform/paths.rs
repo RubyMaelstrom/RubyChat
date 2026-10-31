@@ -4,6 +4,7 @@
 
 use std::path::PathBuf;
 
+#[cfg(not(windows))]
 const DIRECTORY: &str = "rubychat";
 
 /// `$XDG_STATE_HOME/rubychat`: state that should outlive a restart but isn't

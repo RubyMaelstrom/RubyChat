@@ -1226,6 +1226,7 @@ dependencies = [
  "wayland-client",
  "wayland-protocols",
  "webpki-roots",
+ "windows-sys 0.61.2",
  "winit",
 ]
 

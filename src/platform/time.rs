@@ -44,8 +44,47 @@ pub fn local(unix_ms: i64) -> LocalTime {
     }
 }
 
-/// `unix_ms` in UTC until the Windows build reads the time zone.
-#[cfg(not(unix))]
+/// `unix_ms` in the active time zone, daylight saving time included
+/// (`SystemTimeToTzSpecificLocalTime` with no zone given).
+#[cfg(windows)]
+pub fn local(unix_ms: i64) -> LocalTime {
+    use windows_sys::Win32::Foundation::SYSTEMTIME;
+    use windows_sys::Win32::System::Time::SystemTimeToTzSpecificLocalTime;
+
+    let universal = utc(unix_ms);
+    // What a SYSTEMTIME can hold.
+    if !(1601..=30827).contains(&universal.year) {
+        return universal;
+    }
+    let from = SYSTEMTIME {
+        wYear: universal.year as u16,
+        wMonth: u16::from(universal.month),
+        wDayOfWeek: 0,
+        wDay: u16::from(universal.day),
+        wHour: u16::from(universal.hour),
+        wMinute: u16::from(universal.minute),
+        wSecond: u16::from(universal.second),
+        wMilliseconds: 0,
+    };
+    // SAFETY: a zeroed SYSTEMTIME is a valid value of the plain C struct.
+    let mut to: SYSTEMTIME = unsafe { std::mem::zeroed() };
+    // SAFETY: both structs outlive the call; a null zone means the active
+    // one.
+    if unsafe { SystemTimeToTzSpecificLocalTime(std::ptr::null(), &from, &mut to) } == 0 {
+        return universal;
+    }
+    LocalTime {
+        year: i32::from(to.wYear),
+        month: to.wMonth as u8,
+        day: to.wDay as u8,
+        hour: to.wHour as u8,
+        minute: to.wMinute as u8,
+        second: to.wSecond as u8,
+    }
+}
+
+/// `unix_ms` in UTC where there is no time zone to read.
+#[cfg(not(any(unix, windows)))]
 pub fn local(unix_ms: i64) -> LocalTime {
     utc(unix_ms)
 }

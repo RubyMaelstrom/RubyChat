@@ -40,12 +40,28 @@ pub(super) fn certificate_path(text: &str) -> PathBuf {
     if path.is_absolute() {
         return path;
     }
-    if let Some(rest) = text.strip_prefix("~/")
-        && let Some(home) = std::env::var_os("HOME")
+    if let Some(rest) = home_relative(text)
+        && let Some(home) = home_dir()
     {
-        return PathBuf::from(home).join(rest);
+        return home.join(rest);
     }
     paths::config_dir().map_or(path.clone(), |dir| dir.join("certs").join(path))
+}
+
+/// What follows `~/`, or on Windows `~\` too.
+fn home_relative(text: &str) -> Option<&str> {
+    let rest = text.strip_prefix("~/");
+    #[cfg(windows)]
+    let rest = rest.or_else(|| text.strip_prefix("~\\"));
+    rest
+}
+
+/// `$HOME`, or on Windows `%USERPROFILE%` where that isn't set.
+fn home_dir() -> Option<PathBuf> {
+    let home = std::env::var_os("HOME");
+    #[cfg(windows)]
+    let home = home.or_else(|| std::env::var_os("USERPROFILE"));
+    home.filter(|home| !home.is_empty()).map(PathBuf::from)
 }
 
 impl App {
@@ -635,15 +651,13 @@ mod tests {
 
     #[test]
     fn certificate_paths_resolve_like_the_design_says() {
-        assert_eq!(
-            certificate_path("/etc/irc/me.pem"),
-            PathBuf::from("/etc/irc/me.pem")
-        );
-        if let Some(home) = std::env::var_os("HOME") {
-            assert_eq!(
-                certificate_path("~/me.pem"),
-                PathBuf::from(home).join("me.pem")
-            );
+        #[cfg(windows)]
+        let absolute = r"C:\certs\me.pem";
+        #[cfg(not(windows))]
+        let absolute = "/etc/irc/me.pem";
+        assert_eq!(certificate_path(absolute), PathBuf::from(absolute));
+        if let Some(home) = home_dir() {
+            assert_eq!(certificate_path("~/me.pem"), home.join("me.pem"));
         }
         if let Some(dir) = paths::config_dir() {
             assert_eq!(certificate_path("libera.pem"), dir.join("certs/libera.pem"));
