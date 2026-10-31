@@ -43,6 +43,8 @@ const COMMANDS: &[&str] = &[
     "reconnect",
     "search",
     "server",
+    "set",
+    "settings",
     "topic",
     "unignore",
     "voice",
@@ -59,6 +61,7 @@ const HELP: &[&str] = &[
     "/connect <server>, /reconnect, /disconnect [reason]",
     "/ignore [nick|mask], /unignore <nick|mask>; /filter hides joins, parts and quits of people who haven't spoken lately",
     "/list [channels or conditions] browses the network's channels; /search <text> (Ctrl+F) finds text here, earlier history included",
+    "/set lists settings, /set <name> [value] changes one (- empties a list); /settings shows them; Ctrl+K switches buffers",
     "Alt+Up/Down or Alt+1–9 switch buffers, Ctrl+Tab networks; Ctrl+J joins, Ctrl+W closes; Tab completes; F7 and F8 hide the nick list and sidebar.",
     "Any other /command is sent as a raw line: /whowas ruby sends WHOWAS ruby.",
 ];
@@ -341,6 +344,8 @@ impl App {
             }
             "join" | "j" => self.join(args),
             "list" => self.open_channels(args),
+            "set" => self.set_command(args),
+            "settings" => self.open_settings(),
             "search" => self.open_find((!args.is_empty()).then_some(args)),
             "part" | "leave" => self.part(args),
             "close" => {
@@ -514,11 +519,15 @@ impl App {
                 self.ignores_changed(index);
             }
             "filter" => {
-                self.smart_filter = match args {
+                // The setting, kept.
+                let mut settings = self.settings.clone();
+                settings.smart_filter = match args {
                     "on" => true,
                     "off" => false,
                     _ => !self.smart_filter,
                 };
+                self.apply_settings(settings);
+                self.save_settings();
                 let text = if self.smart_filter {
                     "The smart filter hides joins, parts and quits of people who haven't spoken lately"
                 } else {

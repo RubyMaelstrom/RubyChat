@@ -390,6 +390,7 @@ mod tests {
                 label_chars: 5,
                 filter: false,
                 loading: false,
+                seconds: false,
             },
             anchor: None,
             selection: None,

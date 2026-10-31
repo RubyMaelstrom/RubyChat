@@ -52,6 +52,8 @@ impl App {
         };
         self.send(NetCommand::Send(id, line));
         self.close_find();
+        self.close_switcher();
+        self.close_settings();
         self.browser = Some(Browser {
             network: id,
             filter: LineEditor::default(),

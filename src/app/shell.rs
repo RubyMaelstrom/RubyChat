@@ -87,7 +87,7 @@ impl App {
     /// The window's close button: to the tray while one shows RubyChat,
     /// else quitting.
     pub(super) fn close_window(&mut self) {
-        if !self.shell.tray {
+        if !self.shell.tray || !self.settings.close_to_tray {
             self.quit = true;
             return;
         }
@@ -283,7 +283,7 @@ impl App {
         let Some(network) = self.networks.get(index) else {
             return;
         };
-        if watched || alerts.is_empty() || network.demo {
+        if watched || alerts.is_empty() || network.demo || !self.settings.notifications {
             return;
         }
         let now = now_ms();

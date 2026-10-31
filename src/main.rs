@@ -25,7 +25,10 @@ Environment:
 ";
 
 fn main() -> ExitCode {
-    let mut options = Options::default();
+    let mut options = Options {
+        launched: Some(std::time::Instant::now()),
+        ..Options::default()
+    };
     let mut show = false;
     for argument in std::env::args().skip(1) {
         match argument.as_str() {

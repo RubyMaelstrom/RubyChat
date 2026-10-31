@@ -63,7 +63,7 @@ impl App {
                 line.kind,
                 LineKind::Message | LineKind::Action | LineKind::Notice | LineKind::Event
             );
-            if kept && !line.history && !line.failed {
+            if kept && !line.history && !line.failed && self.settings.logging {
                 store.log(LogLine {
                     network: net.title.clone(),
                     buffer: buf.key.clone(),

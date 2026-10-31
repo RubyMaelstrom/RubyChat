@@ -137,6 +137,7 @@ fn paint_budgets() {
         label_chars: buffer.label_chars,
         filter: true,
         loading: false,
+        seconds: false,
     };
 
     // Switching to the buffer paints everything below the strip.
@@ -250,10 +251,69 @@ fn paint_budgets() {
         assert!(found.is_none());
     });
 
+    // A resizing frame: the window a little narrower or wider, so the
+    // canvas grows and every line in view wraps anew.
+    let mut narrower = false;
+    let resize = measure(|| {
+        narrower = !narrower;
+        let width = if narrower { SIZE.0 - 9.0 } else { SIZE.0 };
+        canvas.resize(width as u32, SIZE.1 as u32);
+        let chat = Rect::new(chat.x, chat.y, chat.width - (SIZE.0 - width), chat.height);
+        let buffer = &state.buffers[index];
+        let view = ChatView {
+            lines: buffer.lines(),
+            context: context(buffer),
+            anchor: None,
+            selection: None,
+            hovered: None,
+            found: None,
+            focused: true,
+        };
+        let mut painter = Painter::new(&mut canvas, &mut text, 1.0);
+        painter.fill_rect(Rect::new(0.0, 0.0, width, SIZE.1), CYAN);
+        chat_view::paint_chat(&mut painter, chat, &view, Default::default(), false);
+        let buffer = &mut state.buffers[index];
+        let members: Vec<&Member> = buffer.members.sorted(&state.isupport).collect();
+        paint_nick_list(
+            &mut painter,
+            Rect::new(
+                width - NICK_LIST_WIDTH,
+                nicks.y,
+                NICK_LIST_WIDTH,
+                nicks.height,
+            ),
+            &members,
+            0.0,
+            None,
+        );
+    });
+
+    // Messages ingested: each PRIVMSG applied to a busy channel.
+    let messages: Vec<crate::irc::Message> = (0..20_000)
+        .map(|n| {
+            crate::irc::Message::parse(&format!(
+                "@time=2026-10-31T12:00:00.000Z :member{:04}!u@host PRIVMSG #rust :message number {n}, with a link https://example.org/{n} in it",
+                n % 1000
+            ))
+            .unwrap()
+        })
+        .collect();
+    let started = Instant::now();
+    for message in &messages {
+        state.apply(message, 0);
+    }
+    let per_message = started.elapsed() / messages.len() as u32;
+    let per_second = 1.0 / per_message.as_secs_f64().max(1e-9);
+
     eprintln!("paint budgets at 2560 × 1440 (median of {RUNS}):");
+    eprintln!("  ingest             {per_second:>7.0} messages a second  (budget 50,000)");
+    if cfg!(not(debug_assertions)) {
+        assert!(per_second >= 50_000.0, "{per_second} messages a second");
+    }
     for (name, took, budget) in [
         ("keystroke", keystroke, Duration::from_millis(1)),
         ("find, no match", find, Duration::from_millis(1)),
+        ("resizing frame", resize, Duration::from_millis(8)),
         ("switching buffer", switch, Duration::from_millis(4)),
         ("scrolling frame", scroll, Duration::from_millis(3)),
     ] {

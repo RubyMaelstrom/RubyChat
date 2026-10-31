@@ -59,6 +59,7 @@ impl App {
                     Document::KnownHosts,
                     Document::Sts,
                     Document::Session,
+                    Document::Settings,
                 ] {
                     store.load(document);
                 }
@@ -110,6 +111,15 @@ impl App {
                         .ok()
                 });
                 self.startup.session = Some(session);
+            }
+            Document::Settings => {
+                if let Some(text) = text {
+                    match crate::config::settings::Settings::parse(&text) {
+                        Ok(settings) => self.apply_settings(settings),
+                        Err(error) => eprintln!("rubychat: {error}"),
+                    }
+                }
+                return;
             }
             Document::Recent => return,
         }

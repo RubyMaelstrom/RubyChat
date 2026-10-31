@@ -80,6 +80,8 @@ pub struct ChatContext<'a> {
     pub filter: bool,
     /// Earlier lines are on their way: the oldest line says so.
     pub loading: bool,
+    /// The time column shows seconds.
+    pub seconds: bool,
 }
 
 impl ChatContext<'_> {
@@ -102,12 +104,13 @@ pub struct Columns {
 }
 
 impl Columns {
-    pub fn new(text: &mut TextSystem, rect: Rect, label_chars: usize) -> Self {
+    pub fn new(text: &mut TextSystem, rect: Rect, label_chars: usize, seconds: bool) -> Self {
         let style = chat_style();
         let metrics = text.metrics(&style);
         let digit = text.width("0", &style);
         let time_x = rect.x + PADDING_X;
-        let label_x = time_x + 5.0 * digit + COLUMN_GAP;
+        let time_chars = if seconds { 8.0 } else { 5.0 };
+        let label_x = time_x + time_chars * digit + COLUMN_GAP;
         let label_width = digit * label_chars.clamp(LABEL_MIN, LABEL_MAX) as f32;
         let rule_x = (label_x + label_width + COLUMN_GAP - 2.0).round();
         let text_x = rule_x + 1.0 + COLUMN_GAP - 2.0;
@@ -429,7 +432,7 @@ pub fn scroll(
     pixels: f32,
 ) -> Option<Anchor> {
     let last = lines.len().checked_sub(1)?;
-    let columns = Columns::new(text, rect, context.label_chars);
+    let columns = Columns::new(text, rect, context.label_chars, context.seconds);
     let height =
         |text: &mut TextSystem, index| layout_block(text, &columns, context, lines, index).height;
     let (mut index, mut below) = match anchor {
@@ -665,7 +668,12 @@ pub fn paint_chat(
     scrolled: bool,
 ) -> ChatFrame {
     let lines = view.lines;
-    let columns = Columns::new(painter.text, rect, view.context.label_chars);
+    let columns = Columns::new(
+        painter.text,
+        rect,
+        view.context.label_chars,
+        view.context.seconds,
+    );
     let reusable = previous.columns == Some(columns)
         && previous.rect == rect
         && previous.filter == view.context.filter
@@ -844,9 +852,12 @@ pub fn paint_chat(
                     .round()
             };
             let local = time::local(line.time);
-            let stamp = painter
-                .text
-                .shape(&format!("{:02}:{:02}", local.hour, local.minute), &style);
+            let clock = if view.context.seconds {
+                format!("{:02}:{:02}:{:02}", local.hour, local.minute, local.second)
+            } else {
+                format!("{:02}:{:02}", local.hour, local.minute)
+            };
+            let stamp = painter.text.shape(&clock, &style);
             painter.draw_text(&stamp, columns.time_x, baseline(0), DISABLED);
             let label = line.label();
             if !label.is_empty() {
@@ -1076,6 +1087,7 @@ mod tests {
             label_chars: 6,
             filter: true,
             loading: false,
+            seconds: false,
         }
     }
 
@@ -1266,7 +1278,7 @@ mod tests {
         let many = lines(100);
         let mut text = TextSystem::new();
         let rect = Rect::new(0.0, 0.0, 500.0, 200.0);
-        let row = Columns::new(&mut text, rect, 6).row_height;
+        let row = Columns::new(&mut text, rect, 6, false).row_height;
         let up = scroll(&mut text, rect, &context(), &many, None, row * 2.5).unwrap();
         assert_eq!(up.id, 98);
         assert!((up.below - row * 0.5).abs() < 1e-3);
@@ -1281,7 +1293,7 @@ mod tests {
     fn formatting_links_and_controls() {
         let mut text = TextSystem::new();
         let rect = Rect::new(0.0, 0.0, 600.0, 100.0);
-        let columns = Columns::new(&mut text, rect, 6);
+        let columns = Columns::new(&mut text, rect, 6, false);
         let mut lines = VecDeque::new();
         lines.push_back(Line::message(
             0,
@@ -1322,7 +1334,7 @@ mod tests {
     fn rules_mark_new_messages_and_days() {
         let mut text = TextSystem::new();
         let rect = Rect::new(0.0, 0.0, 600.0, 100.0);
-        let columns = Columns::new(&mut text, rect, 6);
+        let columns = Columns::new(&mut text, rect, 6, false);
         let day = 86_400_000;
         let mut lines: VecDeque<Line> = (0..3)
             .map(|i| {

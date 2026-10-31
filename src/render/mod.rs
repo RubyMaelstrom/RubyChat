@@ -5,6 +5,8 @@
 pub mod canvas;
 pub mod color;
 pub mod damage;
+pub mod emoji;
+pub mod fallback;
 pub mod font;
 pub mod geom;
 pub mod glyph_cache;

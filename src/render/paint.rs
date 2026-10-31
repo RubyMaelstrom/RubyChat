@@ -199,6 +199,19 @@ impl<'a> Painter<'a> {
             subpixel = 0;
         }
         let row = baseline + (glyph.y * self.scale).round() as i32;
+        // Color glyphs are images, whole pixels from the pen.
+        if self.text.is_color(glyph.face) {
+            let clip = self.clip;
+            if let Some(color) = self.text.color_glyph((glyph.face, glyph.id, ppem)) {
+                self.canvas.blend_image(
+                    px.round() as i32 + color.left,
+                    row + color.top,
+                    &color.image,
+                    clip,
+                );
+            }
+            return;
+        }
         let key = GlyphKey {
             face: glyph.face,
             glyph: glyph.id,

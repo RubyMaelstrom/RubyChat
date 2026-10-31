@@ -1083,3 +1083,145 @@ fn the_channel_list_streams_in_filters_sorts_and_joins() {
         Some("Server load is temporarily too heavy")
     );
 }
+
+#[test]
+fn the_quick_switcher_finds_any_buffer_most_active_first() {
+    let mut app = app();
+    let libera = registered(&mut app);
+    receive(&mut app, libera, ":ruby!u@h JOIN #rust");
+    receive(&mut app, libera, ":ruby!u@h JOIN #linux");
+    let oftc = app.add_network(
+        String::from("OFTC"),
+        ConnectConfig::new("irc.oftc.net", 6697, true, "ruby"),
+    );
+    app.apply(NetEvent::Status(
+        oftc,
+        LinkStatus::Registered {
+            nick: String::from("ruby"),
+        },
+    ));
+    receive(&mut app, oftc, ":ruby!u@h JOIN #debian");
+    // Something waits in #linux, and someone mentioned you in #debian.
+    receive(&mut app, libera, ":alice!a@h PRIVMSG #linux :news");
+    receive(&mut app, oftc, ":bob!b@h PRIVMSG #debian :ruby: hello");
+    let rust = app.networks[0].state.find("#rust").unwrap();
+    app.activate(0);
+    app.activate_buffer(rust);
+    app.open_switcher();
+    let names = |app: &App| -> Vec<String> {
+        app.switcher_rows()
+            .0
+            .iter()
+            .map(|row| row.name.clone())
+            .collect()
+    };
+    let shown = names(&app);
+    assert_eq!(shown[..2], ["#debian", "#linux"], "{shown:?}");
+    assert_eq!(
+        shown.last().map(String::as_str),
+        Some("#rust"),
+        "shown last"
+    );
+    // Typing narrows; the network's name counts too.
+    app.editor().set("deb");
+    app.switcher_edited();
+    assert_eq!(names(&app), ["#debian"]);
+    app.editor().set("oftc");
+    app.switcher_edited();
+    assert_eq!(names(&app)[0], "OFTC", "its server buffer first");
+    app.editor().set("lin");
+    app.switcher_edited();
+    app.switcher_choose(None);
+    assert!(app.switcher.is_none());
+    assert_eq!(app.active, 0);
+    assert_eq!(shown_name(&app), "#linux");
+    // Nothing matching says so; Esc's close leaves the draft alone.
+    app.open_switcher();
+    app.editor().set("zzz");
+    app.switcher_edited();
+    assert!(names(&app).is_empty());
+    app.close_switcher();
+    assert_eq!(app.editor().text(), "");
+}
+
+fn shown_name(app: &App) -> String {
+    app.networks[app.active].buffer().name.clone()
+}
+
+#[test]
+fn settings_change_from_set_and_the_panel() {
+    use crate::config::settings::Key;
+    let mut app = app();
+    let id = registered(&mut app);
+    receive(&mut app, id, ":ruby!u@h JOIN #rust");
+    type_line(&mut app, "/set");
+    let listed = network(&app).buffer().lines().len();
+    assert!(listed >= Key::ALL.len());
+    // A highlight word highlights, as your nick does.
+    type_line(&mut app, "/set highlight_words ferris, crab");
+    assert_eq!(app.settings.highlight_words, ["ferris", "crab"]);
+    receive(&mut app, id, ":alice!a@h PRIVMSG #rust :the CRAB is here");
+    let rust = app.networks[0].state.find("#rust").unwrap();
+    assert!(
+        app.networks[0].state.buffers[rust]
+            .lines()
+            .back()
+            .unwrap()
+            .highlight
+    );
+    receive(&mut app, id, ":alice!a@h PRIVMSG #rust :a crab!");
+    assert!(
+        app.networks[0].state.buffers[rust]
+            .lines()
+            .back()
+            .unwrap()
+            .highlight
+    );
+    // Not inside a longer word, as with nicks.
+    receive(
+        &mut app,
+        id,
+        ":alice!a@h PRIVMSG #rust :crabs and crab-like things",
+    );
+    assert!(
+        !app.networks[0].state.buffers[rust]
+            .lines()
+            .back()
+            .unwrap()
+            .highlight
+    );
+    type_line(&mut app, "/set highlight_words -");
+    assert!(app.settings.highlight_words.is_empty());
+    // Switches flip; /filter is the smart filter's setting.
+    type_line(&mut app, "/set seconds");
+    assert!(app.settings.seconds);
+    type_line(&mut app, "/filter off");
+    assert!(!app.settings.smart_filter && !app.smart_filter);
+    type_line(&mut app, "/set nonsense on");
+    let last = network(&app).buffer().lines().back().unwrap();
+    assert_eq!(last.kind, LineKind::Error);
+    // The panel: Down to a switch, Enter flips it; Esc closes.
+    app.open_settings();
+    let down = Key::from_name("seconds").unwrap();
+    let row = Key::ALL.iter().position(|key| *key == down).unwrap();
+    for _ in 0..row {
+        app.settings_key(&winit::keyboard::Key::Named(
+            winit::keyboard::NamedKey::ArrowDown,
+        ));
+    }
+    app.settings_key(&winit::keyboard::Key::Named(
+        winit::keyboard::NamedKey::Enter,
+    ));
+    assert!(!app.settings.seconds);
+    // Words are edited in the input row.
+    app.activate_setting(Key::LinkCommand);
+    app.editor().set("firefox --new-tab");
+    app.settings_key(&winit::keyboard::Key::Named(
+        winit::keyboard::NamedKey::Enter,
+    ));
+    assert_eq!(app.settings.link_command, "firefox --new-tab");
+    app.settings_key(&winit::keyboard::Key::Named(
+        winit::keyboard::NamedKey::Escape,
+    ));
+    assert!(app.settings_panel.is_none());
+}

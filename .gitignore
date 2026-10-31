@@ -11,3 +11,4 @@
 # Local environment settings.
 .env
 .env.*
+/dist/

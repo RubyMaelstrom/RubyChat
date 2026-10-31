@@ -21,6 +21,17 @@ pub struct LineEditor {
     draft: String,
     /// Horizontal scroll that keeps the caret visible, in logical pixels.
     pub scroll: f32,
+    /// Text an input method is composing at the caret, not yet part of the
+    /// text.
+    pub preedit: Option<Preedit>,
+}
+
+/// An input method's composition (DESIGN.md §8.8): its text, and the range
+/// of it the method marks as its cursor, in bytes.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Preedit {
+    pub text: String,
+    pub cursor: Option<(usize, usize)>,
 }
 
 impl LineEditor {

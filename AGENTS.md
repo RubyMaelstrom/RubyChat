@@ -14,10 +14,12 @@ hand-built D-Bus client, the StatusNotifierItem tray and its dbusmenu,
 notifications, closing to the tray, xdg-activation, single instance and
 `irc://` hand-over, the desktop file and icons), M5 (batches,
 echo-message, labeled-response, away and account state, WHOX, MONITOR,
-standard replies, STS, the smart filter, ignores) and M6 (chat logs,
+standard replies, STS, the smart filter, ignores), M6 (chat logs,
 backlog paging, chathistory with event playback, read markers, search, the
-channel list) are implemented on Linux; DESIGN.md §16 lists what each left
-for later. M7 (polish) is next. DESIGN.md §17 records the settled
+channel list) and M7 (the font index and fallback, color emoji, IME
+composition, the quick switcher, settings, the release profile and
+packaging) are implemented on Linux; DESIGN.md §16 lists what each left
+for later, the Windows build first. DESIGN.md §17 records the settled
 decisions.
 
 ## Binding rules
@@ -72,18 +74,19 @@ the user's explicit approval.
 ## Diagnostics
 
 - `RUBYCHAT_TRACE=1` logs every frame's paint and present times, its damage
-  and buffer age, every event-loop wake and focus change. An idle window
-  logs nothing.
+  and buffer age, every event-loop wake and focus change, and how long
+  after launch the first frame was presented. An idle window logs nothing.
 - `RUBYCHAT_EXIT_AFTER=SECONDS` quits cleanly (QUIT to every server) after
   that long; `RUBYCHAT_SNAPSHOT=FILE.png` saves the window's last frame on
   exit. Together they check the real window without screenshots, for
   example `RUBYCHAT_EXIT_AFTER=9 RUBYCHAT_SNAPSHOT=scratch/shot.png
   target/release/rubychat irc.libera.chat` (`scratch/` is ignored by git).
-- RubyChat keeps a session, pins and chat logs: runs that connect anywhere
-  should use throwaway directories, so the user's next start and logs
-  aren't changed, for example `XDG_CONFIG_HOME=$PWD/scratch/xdg/config
+- RubyChat keeps a session, pins, settings, chat logs and a font index:
+  runs that connect anywhere should use throwaway directories, so the
+  user's next start and logs aren't changed, for example
+  `XDG_CONFIG_HOME=$PWD/scratch/xdg/config
   XDG_STATE_HOME=$PWD/scratch/xdg/state XDG_DATA_HOME=$PWD/scratch/xdg/data
-  target/release/rubychat …`. A
+  XDG_CACHE_HOME=$PWD/scratch/xdg/cache target/release/rubychat …`. A
   `networks.toml` there tries saved networks, logins included. The single
   instance is keyed by the executable and configuration directory, so such
   a run never hands over to the user's own RubyChat (and a second launch
@@ -109,14 +112,17 @@ the user's explicit approval.
   and a small client with SASL plays the other side.
 - `RUBYCHAT_SNAPSHOTS=DIR cargo test --lib snapshots -- --ignored` writes the
   tab strip, window, context menu, Server Manager, trust prompt, tray
-  icon, channel list and search snapshots; `tab-strip-parity.png` uses
-  trust-desktop's preview titles for side-by-side comparison.
+  icon, channel list, search, quick switcher and settings snapshots;
+  `tab-strip-parity.png` uses trust-desktop's preview titles for
+  side-by-side comparison.
 - `--demo` opens placeholder networks with channels, members, formatting,
   links, highlights and unread badges: the whole M2 window without
   connecting. `rubychat 'ircs://irc.libera.chat/##rubychat-test'` connects
   and joins a channel (IRC URLs, DESIGN.md §17).
 - `cargo test --release --lib paint_budgets -- --ignored --nocapture` checks
-  the §10 frame budgets at 2560 × 1440, and a search that finds nothing;
+  the §10 frame budgets at 2560 × 1440 (keystroke, buffer switch,
+  scrolling and resizing frames), a search that finds nothing and messages
+  ingested a second;
   `list_budgets` checks a 100,000-channel LIST (M6's check): replies
   applied, the filtering and sorting slices, and the table repainted.
 - `RUBYCHAT_CHECK_CLIPBOARD=1` pastes the clipboard's text into the input,
@@ -127,6 +133,13 @@ the user's explicit approval.
   on Libera.Chat over TLS and reads the MOTD.
 - `python3 tools/gen_parser_vectors.py` regenerates `src/irc/vectors.rs`
   from the ircdocs parser tests in the standards library.
+- `cargo test --release --lib installed_fonts -- --ignored --nocapture`
+  indexes this machine's fonts into a scratch cache and times it; `--demo`
+  shows a line of CJK, symbols and emoji for checking fallback by eye.
+- `tools/package.sh` builds the release binary and writes
+  `dist/rubychat-<version>-<arch>-linux.tar.gz` (ignored by git) with the
+  desktop entry, icons, licenses and an `install.sh` taking a prefix. Run
+  that installer only into scratch prefixes unless the user asks.
 
 ## Conventions
 

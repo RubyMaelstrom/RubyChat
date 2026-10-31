@@ -17,7 +17,7 @@ const FOOT: f32 = 7.0;
 /// The distance kept from the area's edges.
 const MARGIN: f32 = 4.0;
 /// The drop shadow's reach below and around the panel.
-const SHADOW: f32 = 10.0;
+pub(super) const SHADOW: f32 = 10.0;
 
 /// The pictogram beside an item, in the menu's line style.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -181,7 +181,7 @@ fn outline(panel: Rect, grow: f32) -> Path {
 /// COMMAND's panel: a soft shadow, the chamfered surface and its etched
 /// edge, the pink and cyan accents, traces, and a badge naming what the
 /// menu acts on.
-fn paint_panel(painter: &mut Painter<'_>, panel: Rect, badge: &str, title: &str) {
+pub(super) fn paint_panel(painter: &mut Painter<'_>, panel: Rect, badge: &str, title: &str) {
     // A static shadow in a few translucent steps: no blur pass, no timer.
     for (grow, alpha) in [(6.0, 18), (3.5, 26), (1.5, 34)] {
         let shadow = outline(panel.translate(0.0, 5.0), grow);
@@ -343,7 +343,7 @@ const OCTAGON: [(f32, f32); 8] = [
     (1.0, 4.5),
 ];
 
-fn paint_icon(painter: &mut Painter<'_>, icon: MenuIcon, rect: Rect, color: Color) {
+pub(super) fn paint_icon(painter: &mut Painter<'_>, icon: MenuIcon, rect: Rect, color: Color) {
     let line = |painter: &mut Painter<'_>, points: &[(f32, f32)], close: bool| {
         polyline(painter, rect, points, close, color)
     };

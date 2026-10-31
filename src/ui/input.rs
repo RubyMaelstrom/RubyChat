@@ -14,7 +14,9 @@ pub fn input_style() -> TextStyle {
 /// Paints COMMAND's input field in `rect`: inset surface, etched edge, cyan
 /// left edge and prompt, the text scrolled to keep the caret in view, and a
 /// steady caret (no blinking, so an idle window never wakes). A `note`
-/// (search's NO MATCHES) sits at the right end.
+/// (search's NO MATCHES) sits at the right end. An input method's
+/// composition shows at the caret, underlined. Returns the caret's
+/// rectangle, where the input method's candidates go.
 pub fn paint_input(
     painter: &mut Painter<'_>,
     rect: Rect,
@@ -23,7 +25,7 @@ pub fn paint_input(
     placeholder: &str,
     focused: bool,
     note: Option<&str>,
-) {
+) -> Rect {
     painter.fill_rect(rect, INSET);
     painter.stroke_rect(rect, 1.0, EDGE);
     painter.fill_rect(
@@ -62,10 +64,23 @@ pub fn paint_input(
         rect.height,
     );
     let style = input_style();
-    if editor.text().is_empty() {
+    // The composition goes in at the caret, for showing only.
+    let cursor = editor.cursor();
+    let preedit = editor
+        .preedit
+        .clone()
+        .filter(|preedit| !preedit.text.is_empty());
+    let shown = match &preedit {
+        Some(preedit) => {
+            let text = editor.text();
+            format!("{}{}{}", &text[..cursor], preedit.text, &text[cursor..])
+        }
+        None => editor.text().to_string(),
+    };
+    if shown.is_empty() {
         painter.label(placeholder, field, &style, DISABLED, Align::Start);
     }
-    let shaped = painter.text.shape(editor.text(), &style);
+    let shaped = painter.text.shape(&shown, &style);
     let offset_of = |byte: usize| -> f32 {
         shaped
             .glyphs
@@ -73,7 +88,16 @@ pub fn paint_input(
             .find(|glyph| glyph.cluster as usize >= byte)
             .map_or(shaped.advance, |glyph| glyph.x)
     };
-    let caret = offset_of(editor.cursor());
+    let caret_byte = match &preedit {
+        Some(preedit) => {
+            cursor
+                + preedit
+                    .cursor
+                    .map_or(preedit.text.len(), |(start, _)| start)
+        }
+        None => cursor,
+    };
+    let caret = offset_of(caret_byte);
     // Keep the caret inside the field with a little room to its right.
     if caret - editor.scroll > field.width - 4.0 {
         editor.scroll = caret - field.width + 4.0;
@@ -88,7 +112,9 @@ pub fn paint_input(
     let top = (field.y + (field.height - shaped.line_height) / 2.0).round();
     let x = field.x - editor.scroll;
     painter.save_clip(field);
-    if let Some(range) = editor.selection() {
+    if preedit.is_none()
+        && let Some(range) = editor.selection()
+    {
         let (start, end) = (offset_of(range.start), offset_of(range.end));
         painter.fill_rect(
             Rect::new(x + start, top, end - start, shaped.line_height),
@@ -96,11 +122,55 @@ pub fn paint_input(
         );
     }
     painter.draw_text(&shaped, x, shaped.baseline(top).round(), TEXT);
-    if focused {
+    if let Some(preedit) = &preedit {
+        let (start, end) = (offset_of(cursor), offset_of(cursor + preedit.text.len()));
         painter.fill_rect(
-            Rect::new((x + caret).round(), top, 2.0, shaped.line_height),
+            Rect::new(x + start, top + shaped.line_height - 1.0, end - start, 1.0),
             CYAN,
         );
     }
+    let caret_rect = Rect::new((x + caret).round(), top, 2.0, shaped.line_height);
+    if focused {
+        painter.fill_rect(caret_rect, CYAN);
+    }
     painter.restore();
+    caret_rect
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::editor::Preedit;
+    use crate::render::{Canvas, TextSystem};
+
+    #[test]
+    fn a_composition_shows_at_the_caret_underlined() {
+        let mut canvas = Canvas::new(600, 60);
+        let mut text = TextSystem::new();
+        let rect = Rect::new(10.0, 10.0, 580.0, 36.0);
+        let mut editor = LineEditor::default();
+        editor.insert("ab");
+        let before = {
+            let mut painter = Painter::new(&mut canvas, &mut text, 1.0);
+            paint_input(&mut painter, rect, &mut editor, "ruby›", "", true, None)
+        };
+        editor.preedit = Some(Preedit {
+            text: String::from("にほん"),
+            cursor: None,
+        });
+        let mut canvas = Canvas::new(600, 60);
+        let after = {
+            let mut painter = Painter::new(&mut canvas, &mut text, 1.0);
+            paint_input(&mut painter, rect, &mut editor, "ruby›", "", true, None)
+        };
+        assert!(
+            after.x > before.x + 10.0,
+            "the caret follows the composition"
+        );
+        assert_eq!(editor.text(), "ab", "composing isn't typing");
+        // The underline runs from the old caret to the new.
+        let y = (after.bottom() - 1.0) as u32;
+        let x = ((before.x + after.x) / 2.0) as u32;
+        assert_eq!(canvas.pixel(x, y), CYAN.pixel());
+    }
 }

@@ -1,7 +1,8 @@
 # RubyChat design
 
-Draft 2 · 31 October 2026 · decisions settled (§17); milestones M0 to M6
-are implemented (§16).
+Draft 2 · 31 October 2026 · decisions settled (§17); milestones M0 to M7
+are implemented on Linux; the Windows build waits for a Windows toolchain
+(§16).
 
 RubyChat is a desktop IRC client written in Rust. Its overriding goal is that
 nothing on the client side ever makes you wait. It draws its own interface in
@@ -25,7 +26,7 @@ buffer, a channel, or a query (a private conversation).
 | IRC | Hand-built: RFC 1459/2812, Modern IRC, IRCv3 (CAP 302, SASL, tags, batches, history) |
 | Tray, notifications | Hand-built D-Bus client: StatusNotifierItem, dbusmenu, Desktop Notifications; Shell_NotifyIcon on Windows |
 | Configuration | Hand-parsed TOML subset in XDG directories; passwords in a separate owner-only file |
-| Dependencies | 89 crates in the lock file on Linux; 97 once color emoji lands (§4) |
+| Dependencies | 97 crates in the lock file on Linux (§4) |
 
 ## 2. Goals
 
@@ -78,9 +79,9 @@ registry, for Linux.
 | skrifa 0.44 | Font tables, outlines, hinting, color and bitmap glyph data | A large, security-sensitive parsing surface |
 | harfrust 0.12 | OpenType shaping (the HarfBuzz port) | A specialist domain; shares read-fonts with skrifa |
 | unicode-segmentation 1 | Grapheme and word boundaries (UAX #29) | Unicode data tables; no dependencies of its own |
-| png 0.18, from M7 | Decoding Noto Color Emoji's CBDT bitmaps | inflate plus PNG; 8 more crates |
+| png 0.18 | Decoding Noto Color Emoji's CBDT bitmaps (since M7) | inflate plus PNG; 8 more crates |
 
-Totals: 89 crates for everything but png, 97 with it. On the same base,
+Totals: 97 crates since M7 (89 before png). On the same base,
 trust-desktop's Parley and Vello CPU text stack plus ksni for the tray would
 make 190; AccessKit adds 71; arboard with Wayland data-control adds 18; zbus
 on its own is 67.
@@ -138,6 +139,11 @@ Adding a crate means adding a row here with its measured transitive cost.
 - As built: the desktop thread is one mio poll over the session bus socket
   and the UI's waker, with no mutex (§12.2). Later launches hand over to an
   instance thread that sleeps in `accept` (§12.4).
+- As built (M7): one font worker indexes the fonts, loads fallback faces
+  and decodes color emoji (§9.5); search pages history into the buffer
+  rather than searching the logs on a worker (§8.10), so the second worker
+  isn't needed yet. Opening a link starts its handler on a short-lived
+  thread.
 
 ### 5.2 Who owns what
 
@@ -528,6 +534,12 @@ per-message limit. Pasting more than three lines asks before sending, or
 sends one `draft/multiline` batch where the server supports it. Hints use
 amber keycaps (`TAB complete · ESC cancel`).
 
+As built (M7): an input method's composition shows at the caret,
+underlined, without becoming text until it commits, and its candidates are
+placed at the caret. Find, the channel filter, the quick switcher and the
+settings panel use the same input row with their own prompts. Not yet: the
+bar growing past one line, the byte count and paste confirmation.
+
 ### 8.9 Server Manager
 
 A COMMAND-style overlay (pink `SERVERS` tag, etched frame), usable entirely
@@ -601,6 +613,17 @@ As built in M6:
   counts channels and says when the list is loading or sorting. At most
   200,000 channels are kept; more are counted.
 
+As built in M7:
+
+- The quick switcher (Ctrl+K) takes its query in the input row (`SWITCH›`)
+  and lists up to ten buffers of every network in COMMAND's panel above
+  it: with nothing typed, highlights first, then unread messages, then
+  other activity, the buffer shown last; typed, a fuzzy match on the
+  buffer's name, or less well on its network's. Up, Down and Tab choose,
+  Enter or a click shows the buffer, Esc closes it.
+- The settings panel (Ctrl+, or `/settings`) lists every setting with its
+  value in the same panel style; see §11.
+
 ### 8.11 Keyboard
 
 | Keys | Action |
@@ -613,6 +636,7 @@ As built in M6:
 | Ctrl+J | Join a channel |
 | Ctrl+W | Close the buffer (part, or close the query) |
 | Ctrl+F | Search |
+| Ctrl+, | Settings (as built, M7; also `/settings`) |
 | PageUp, PageDown, Ctrl+End | Scroll; return to the present |
 | F7, F8 | Toggle the nick list, the sidebar |
 | Esc | Close the overlay; otherwise clear the selection and return to the present |
@@ -687,6 +711,36 @@ overrides in one can't reorder anything around it.
 - Color emoji in CBDT (the format Noto Color Emoji ships in) are decoded and
   downscaled on a worker and cached premultiplied. COLRv1 comes later.
 
+As built (M7):
+
+- The font worker walks `fonts` under `$XDG_DATA_HOME` and each of
+  `$XDG_DATA_DIRS`, then `~/.fonts`, and caches each face's family,
+  weight, style, color and character ranges in
+  `$XDG_CACHE_HOME/rubychat/fonts.index` (text, a line per coverage and per
+  file, keyed by size and modification time; coverages shared between a
+  collection's weights). On the development machine 105 faces index in
+  52 ms, 1 ms from the cache, which is 55 KB.
+- The embedded JetBrains Mono stays the chat face everywhere; the installed
+  JetBrainsMono Nerd Font is the first fallback, for its icons. Then Noto
+  Color Emoji, Noto Sans CJK for the locale's region (SC, TC, HK, JP or
+  KR), DejaVu Sans Mono, DejaVu Sans and Noto Sans and its symbols; the
+  `fallback_fonts` setting puts families before these. Among faces that
+  have a character, an emoji goes to a color face and other text doesn't,
+  then preference, upright, nearest weight.
+- Text shapes in runs of one face, split by grapheme cluster only when the
+  chat face lacks something. A cluster is an emoji when it has a variation
+  selector 16, a joiner, a keycap, a skin tone, regional indicators or a
+  character from the emoji blocks.
+- Fallback faces are memory-mapped and never unloaded, so a 117 MB CJK
+  collection costs only the pages read; at most 64 are loaded. When the
+  index or a face arrives, everything is laid out again once.
+- CBDT glyphs are placed by the OpenType EBLC metrics (`horiBearingX` and
+  `horiBearingY` at the strike's size, scaled), decoded PNGs limited to
+  4 MB. A color glyph not decoded yet leaves its space empty until the
+  worker sends it; the cache holds 16 MiB.
+- Not yet: bidi isolates, COLR, and laying out again only the lines a new
+  face affects.
+
 ### 9.6 Instrumentation
 
 `RUBYCHAT_TRACE=1` logs each frame's event, layout, paint and present times
@@ -755,6 +809,13 @@ as they're measured.
   buffer's last lines load from its log the first time it's shown.
 - As built (M5): STS policies live in `sts.toml` (host, port, duration and
   expiry), and ignore masks in each network's `ignore` list.
+- As built (M7): `settings.toml` holds `smart_filter`, `seconds`,
+  `highlight_words`, `notifications`, `close_to_tray`, `logging`,
+  `fallback_fonts` and `link_command`; anything missing keeps its default.
+  `/set` lists and changes them, `/filter` is the smart filter's, and the
+  settings panel (Ctrl+, or `/settings`) flips switches in place and edits
+  words in the input row. Each change applies at once and is saved. The
+  font index is cached in `$XDG_CACHE_HOME/rubychat/fonts.index`.
 - As built (M6): logs are written by the store thread, a day file per UTC
   date, with the kind's flags (`msg,own,hl`) and the `msgid` after the
   text; the network's directory is its title and the buffer's its
@@ -987,6 +1048,14 @@ the primary selection (middle click) is not supported.
   lost connections, labeled routing of WHOIS, `ACK` and `FAIL`, away and
   account state through WHOX, MONITOR, the smart filter, ignores, STS in
   the link and the app, and labeled sends from the input.
+- Since M7: fuzzy matching and the switcher's order; IME composition
+  drawn at the caret; coverage, the index's choice of face and emoji
+  clusters; indexing fonts and its cache; faces crossing threads; PNG
+  decoding; settings' round trip, `/set` and the panel. `paint_budgets`
+  adds a resizing frame and messages ingested a second;
+  `installed_fonts` indexes the machine's fonts; `switcher_snapshots` and
+  `settings_snapshots` draw the new panels. The trace logs the time from
+  launch to the first frame.
 - Since M6: the log format round trip, file names and reading back across
   day files; history batches with de-duplication and replayed events;
   read markers both ways; history asked for when a buffer first shows,
@@ -1013,7 +1082,7 @@ src/
   main.rs         startup, single-instance handoff, event loop
   lib.rs
   app/            app state, ApplicationHandler, window lifecycle, commands, key map,
-                  history, find, channels
+                  history, find, channels, switcher, settings
   irc/            message, tags, casemap, isupport, cap, sasl/, ctcp, format, modes,
                   numerics, split
   net/            reactor, connect (Happy Eyeballs), tls (verifiers, pins), session,
@@ -1022,14 +1091,16 @@ src/
                   search, channels
   ui/             theme, layout, tab_strip, sidebar, header, chat_view, nick_list, input,
                   context_menu, colors, server_manager, switcher, dialog, widgets,
-                  channel_list
+                  channel_list, settings
   render/         canvas, damage, raster, paint, glyph_cache, text (shape, wrap, bidi),
-                  fonts, emoji, present, snapshot (PNG writer)
+                  fonts, fallback, emoji, present, snapshot (PNG writer)
   platform/       paths, time, open, clipboard, activation, instance, dbus/, desktop/
-                  (the desktop thread: service, tray, notify)
+                  (the desktop thread: service, tray, notify), fonts (the font
+                  worker), mmap
   config/         TOML subset, settings, networks, secrets, session
   store/          log writer and reader, backlog paging
 tests/            scenario tests; fixtures (parser-tests vectors, test certificates)
+tools/            icon and parser-vector generators; package.sh (release archive)
 ```
 
 ## 16. Milestones
@@ -1071,6 +1142,23 @@ window closed, RubyChat wakes nothing; the paint budgets are unchanged.
 Still 89 crates. Not yet: the Windows tray, notifications and named pipe
 (they come with the Windows build, M7), muting a buffer, showing the icon
 only while the window is closed, and installing the desktop file.
+
+M7's scope is implemented and tested on Linux. Every §10 budget is met on
+the development machine (optimized, 2560 × 1440): a keystroke paints in
+0.05 ms, a buffer switch in 3.6 ms, a scrolling frame in 0.8 ms and a
+resizing frame in 4.0 ms; a search keystroke that finds nothing takes
+0.5 ms; about 700,000 messages a second are applied; a burst never holds
+input past the wake's 4 ms; the first frame is presented 23 to 31 ms after
+launch; and an idle window wakes nothing, the font worker included. In the
+real window, CJK and symbols came from the installed fallbacks and emoji
+in color from Noto Color Emoji. The release profile (thin LTO, one code
+generation unit, no symbols) makes an 8.7 MB binary, and `tools/package.sh`
+packs it with the desktop entry, icons, licenses and an `install.sh` for a
+prefix of your choosing. Not yet: the Windows build (no Windows toolchain
+or machine here; Windows paths and file reading are written but neither
+compiled nor run), the multi-line input bar, choosing faces and sizes in
+the settings, bidi, COLR emoji, and a settings surface for networks'
+CTCP, part and quit messages beyond the Server Manager's.
 
 M6's scope is implemented and tested. On the local ergo, a channel's
 history came back on joining with its topic change and an earlier join as
@@ -1195,6 +1283,25 @@ Settled while building M6:
     RubyChat words them rather than as a server's notices about them.
 31. **The channel list sorts by users first**; sorting by name waits for
     the list to be complete, and its order is kept for later filtering.
+
+Settled while building M7:
+
+32. **The embedded face stays the chat face**; the installed Nerd Font is
+    the first fallback, which keeps the look identical everywhere and
+    still draws its icons.
+33. **Fallback fonts are memory-mapped**, as font stacks do: a large
+    collection costs only what's drawn. A font file truncated while
+    RubyChat runs could still crash it; reading whole files instead would
+    cost the memory of every face loaded.
+34. **The quick switcher and the settings panel use the input row** with
+    a panel above it, as search and the channel list do; the switcher
+    matches each word of the query in any order.
+35. **Settings are a file, a command and a panel**, applied as they change;
+    choosing faces and sizes waits for a layout that follows them.
+36. **The Windows build waits** for a Windows toolchain and machine to test
+    on; nothing for Windows is claimed to work until then.
+37. **Releases build with thin LTO, one codegen unit and no symbols**, and
+    ship as an archive with its own installer; nothing installs itself.
 
 ## 18. Standards
 

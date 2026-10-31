@@ -22,6 +22,8 @@ path = "src/main.rs"
 aws-lc-rs = { version = "1.18.1", default-features = false, features = ["aws-lc-sys"] }
 # OpenType shaping (the HarfBuzz port). Shares read-fonts with skrifa.
 harfrust = "0.12.0"
+# Decoding color emoji bitmaps (CBDT holds PNGs): inflate plus PNG.
+png = "0.18.1"
 # Socket readiness and a cross-thread waker for the network thread's reactor.
 mio = { version = "1.2.4", features = ["os-poll", "net"] }
 # TLS 1.2/1.3 on aws-lc-rs, preferring the X25519MLKEM768 hybrid key exchange
@@ -58,3 +60,10 @@ opt-level = 1
 
 [profile.dev.package."*"]
 opt-level = 2
+
+# What ships: one code generation unit and thin link-time optimization, for
+# speed and size, and no symbols.
+[profile.release]
+codegen-units = 1
+lto = "thin"
+strip = "symbols"

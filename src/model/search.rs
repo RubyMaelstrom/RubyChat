@@ -107,6 +107,47 @@ impl Query {
     }
 }
 
+/// How well `text` matches `query`, already in lower case: each word of
+/// the query as letters in order (a fuzzy match), the words in any order.
+/// `None` when one doesn't match. Matches at the start, at the start of a
+/// word and in runs score higher, and so do shorter texts.
+pub fn fuzzy(query: &str, text: &str) -> Option<i32> {
+    let length = i32::try_from(text.chars().count()).unwrap_or(i32::MAX);
+    query
+        .split_whitespace()
+        .try_fold(0i32, |total, word| Some(total + fuzzy_word(word, text)?))
+        .map(|score| score * 8 - length)
+}
+
+fn fuzzy_word(word: &str, text: &str) -> Option<i32> {
+    let mut wanted = word.chars().peekable();
+    let mut score = 0i32;
+    let mut run = false;
+    let mut previous: Option<char> = None;
+    for (index, c) in text.chars().enumerate() {
+        let Some(&want) = wanted.peek() else {
+            break;
+        };
+        if c.to_lowercase().eq(std::iter::once(want)) {
+            wanted.next();
+            score += 1;
+            if index == 0 {
+                score += 8;
+            } else if previous.is_some_and(|p| !p.is_alphanumeric()) {
+                score += 6;
+            }
+            if run {
+                score += 4;
+            }
+            run = true;
+        } else {
+            run = false;
+        }
+        previous = Some(c);
+    }
+    wanted.peek().is_none().then_some(score)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -137,6 +178,25 @@ mod tests {
         // query doesn't match part-way.
         assert!(!Query::new("i").unwrap().is_in("\u{130}"));
         assert!(Query::new("i\u{307}").unwrap().is_in("\u{130}"));
+    }
+
+    #[test]
+    fn fuzzy_matches_rank_starts_and_runs_first() {
+        assert_eq!(fuzzy("xyz", "#rust"), None);
+        assert!(fuzzy("rs", "#rust").is_some(), "letters in order");
+        assert_eq!(fuzzy("tsur", "#rust"), None, "but in order");
+        let rust = fuzzy("rust", "#rust").unwrap();
+        assert!(rust > fuzzy("rust", "#rust-beginners").unwrap(), "shorter");
+        assert!(
+            rust > fuzzy("rust", "#trustfall").unwrap(),
+            "at a word's start"
+        );
+        assert!(
+            fuzzy("rb", "#rust-beginners").unwrap() > fuzzy("rb", "#arbitrary").unwrap(),
+            "word starts beat letters inside words"
+        );
+        assert!(fuzzy("lib rust", "#rust Libera.Chat").is_some());
+        assert!(fuzzy("", "anything").is_some());
     }
 
     #[test]

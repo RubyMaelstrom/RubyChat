@@ -16,8 +16,10 @@ mod history;
 mod manager;
 mod menus;
 mod present;
+mod settings;
 mod shell;
 mod startup;
+mod switcher;
 #[cfg(test)]
 mod tests;
 mod trust;
@@ -37,9 +39,11 @@ use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::{Key, ModifiersState, NamedKey};
 use winit::window::{CursorIcon, Window, WindowId};
 
+use crate::config::settings::Settings;
 use crate::irc::Message;
 use crate::model::buffer::{Buffer, BufferKind};
 use crate::model::channels::Order;
+use crate::model::editor::Preedit;
 use crate::model::members::Member;
 use crate::model::network::{Applied, NetworkState};
 use crate::model::recent::{Recent, RecentServer};
@@ -48,6 +52,7 @@ use crate::net::{ConnectConfig, LinkStatus, NetCommand, NetEvent, NetHandle, Net
 #[cfg(all(unix, not(target_vendor = "apple")))]
 use crate::platform::clipboard::Clipboard;
 use crate::platform::desktop::{Desktop, DesktopEvent};
+use crate::platform::fonts::{FontEvent, Fonts};
 use crate::platform::instance::Request;
 use crate::platform::time::now_ms;
 use crate::render::{Canvas, Damage, Painter, Point, Rect, TextSystem};
@@ -100,6 +105,9 @@ pub struct Options {
     pub token: Option<String>,
     /// The socket later launches hand over to.
     pub instance: Option<crate::platform::instance::Server>,
+    /// When the process started, for the trace's launch-to-first-frame
+    /// time (DESIGN.md §10).
+    pub launched: Option<Instant>,
 }
 
 /// Wakes the event loop from other threads.
@@ -348,6 +356,7 @@ pub struct App {
     quit: bool,
     failure: Option<String>,
     trace: bool,
+    launched: Option<Instant>,
     /// The previous frame's CPU time, shown on the welcome panel.
     last_frame: Option<Duration>,
     frames: u64,
@@ -357,6 +366,9 @@ pub struct App {
     net_inbox: Inbox<NetEvent>,
     store: Option<Store>,
     store_inbox: Inbox<StoreEvent>,
+    /// The font worker: the fallback index and faces (DESIGN.md §9.5).
+    fonts: Option<Fonts>,
+    fonts_inbox: Inbox<FontEvent>,
     desktop_inbox: Inbox<DesktopEvent>,
     /// Requests from later launches.
     instance_inbox: Inbox<Request>,
@@ -389,10 +401,16 @@ pub struct App {
     /// Hide joins, parts, quits and nick changes of people who haven't
     /// spoken lately (DESIGN.md §8.6); `/filter` toggles it.
     smart_filter: bool,
+    /// Settings from `settings.toml` (DESIGN.md §8.10).
+    settings: Settings,
     /// Ctrl+F's find field, while open.
     find: Option<find::Find>,
     /// The channel list (`/list`), while it shows.
     browser: Option<channels::Browser>,
+    /// The quick switcher (Ctrl+K), while open.
+    switcher: Option<switcher::Switcher>,
+    /// The settings panel (`/settings`), while open.
+    settings_panel: Option<settings::SettingsPanel>,
     sidebar_scroll: f32,
     hover: Hover,
     /// What the chat view last showed, for finding what's under the pointer.
@@ -451,6 +469,9 @@ struct View {
     /// When the window last lost the keyboard.
     unfocused_at: Option<Instant>,
     cursor: CursorIcon,
+    /// Where the input method's candidates were last asked to go: the
+    /// input's caret.
+    ime_area: Option<Rect>,
     dirty: Dirty,
 }
 
@@ -508,14 +529,19 @@ impl App {
     pub fn new(options: Options, waker: impl Fn() -> Wake + 'static) -> Result<Self, String> {
         let (net_sink, net_inbox) = Inbox::new(waker());
         let (store_sink, store_inbox) = Inbox::new(waker());
+        let (fonts_sink, fonts_inbox) = Inbox::new(waker());
         let (desktop_sink, desktop_inbox) = Inbox::new(waker());
         let (instance_sink, instance_inbox) = Inbox::new(waker());
         let mut shell = shell::Shell::default();
-        let (net, store) = if options.isolated {
-            (None, None)
+        let (net, store, fonts) = if options.isolated {
+            (None, None, None)
         } else {
             let net = NetHandle::spawn(net_sink).map_err(|e| format!("network thread: {e}"))?;
             let store = Store::spawn(store_sink).map_err(|e| format!("store thread: {e}"))?;
+            // Without the worker, text the chat face lacks shows as boxes.
+            let fonts = Fonts::start(fonts_sink)
+                .inspect_err(|error| eprintln!("rubychat: no fallback fonts: {error}"))
+                .ok();
             store.load(Document::Recent);
             let artwork = crate::platform::desktop::Artwork {
                 tray: crate::ui::branding::tray_icon,
@@ -525,7 +551,7 @@ impl App {
                 Ok(desktop) => shell.desktop = Some(desktop),
                 Err(error) => eprintln!("rubychat: no tray or notifications: {error}"),
             }
-            (Some(net), Some(store))
+            (Some(net), Some(store), fonts)
         };
         if let Some(server) = options.instance
             && let Err(error) = server.serve(instance_sink)
@@ -547,6 +573,7 @@ impl App {
             quit: false,
             failure: None,
             trace: std::env::var_os("RUBYCHAT_TRACE").is_some(),
+            launched: options.launched,
             last_frame: None,
             frames: 0,
             started: Instant::now(),
@@ -554,6 +581,8 @@ impl App {
             net_inbox,
             store,
             store_inbox,
+            fonts,
+            fonts_inbox,
             desktop_inbox,
             instance_inbox,
             shell,
@@ -573,8 +602,11 @@ impl App {
             show_sidebar: true,
             show_nicks: true,
             smart_filter: true,
+            settings: Settings::default(),
             find: None,
             browser: None,
+            switcher: None,
+            settings_panel: None,
             sidebar_scroll: 0.0,
             hover: Hover::default(),
             chat_frame: ChatFrame::default(),
@@ -619,7 +651,11 @@ impl App {
         self.next_id += 1;
         self.networks.push(Network {
             id,
-            state: NetworkState::new(config.nick.clone(), title.clone()),
+            state: {
+                let mut state = NetworkState::new(config.nick.clone(), title.clone());
+                state.set_highlight_words(&self.settings.highlight_words);
+                state
+            },
             title,
             config,
             status: LinkStatus::Resolving,
@@ -706,6 +742,7 @@ impl App {
             focused: true,
             unfocused_at: None,
             cursor: CursorIcon::Default,
+            ime_area: None,
             dirty: Dirty::ALL,
         });
         self.sync_seen();
@@ -1080,6 +1117,49 @@ impl App {
                 self.inbox_ready = true;
                 (self.wake)();
                 break;
+            }
+        }
+    }
+
+    /// The font worker's index and faces: text is laid out anew to use
+    /// them, and faces text asked for are asked of the worker.
+    fn fonts_arrived(&mut self) {
+        self.fonts_inbox.arm();
+        let mut arrived = false;
+        while let Some(event) = self.fonts_inbox.next() {
+            match event {
+                FontEvent::Index(index) => self.text.set_index(index),
+                FontEvent::Loaded(key, Ok(face)) => self.text.add_face(key, *face),
+                FontEvent::Loaded(key, Err(error)) => {
+                    eprintln!("rubychat: {error}");
+                    self.text.face_failed(&key);
+                }
+                // A color glyph changes pixels, not layout.
+                FontEvent::Color(request, glyph) => {
+                    self.text.add_color_glyph(request, glyph);
+                    self.mark_all();
+                    continue;
+                }
+            }
+            arrived = true;
+        }
+        if arrived {
+            // Every layout made without them is stale.
+            self.chat_frame = ChatFrame::default();
+            self.mark_all();
+        }
+    }
+
+    /// Faces the last layouts asked for, and color glyphs painting did, go
+    /// to the font worker.
+    fn ask_for_faces(&mut self) {
+        let (faces, glyphs) = (self.text.take_wanted(), self.text.take_wanted_color());
+        if let Some(fonts) = &self.fonts {
+            for key in faces {
+                fonts.load(key);
+            }
+            for request in glyphs {
+                fonts.decode(request);
             }
         }
     }
@@ -1477,6 +1557,7 @@ impl App {
             label_chars: buffer.label_chars,
             filter: self.smart_filter,
             loading: buffer.history.loading,
+            seconds: self.settings.seconds,
         };
         // Whole pixels, so what's shown can move rather than repaint; the
         // remainder carries over.
@@ -1520,13 +1601,17 @@ impl App {
         match (
             &mut self.manager,
             self.networks.is_empty() || self.prompt_open,
+            &mut self.settings_panel,
+            &mut self.switcher,
             &mut self.find,
             &mut self.browser,
         ) {
             (Some(manager), ..) => &mut manager.editor,
             (None, true, ..) => &mut self.prompt,
-            (None, false, Some(find), _) => &mut find.editor,
-            (None, false, None, Some(browser)) if browsing => &mut browser.filter,
+            (None, false, Some(panel), ..) => &mut panel.editor,
+            (None, false, None, Some(switcher), ..) => &mut switcher.editor,
+            (None, false, None, None, Some(find), _) => &mut find.editor,
+            (None, false, None, None, None, Some(browser)) if browsing => &mut browser.filter,
             (None, false, ..) => &mut self.networks[self.active].buffer_mut().input,
         }
     }
@@ -1551,6 +1636,18 @@ impl App {
         if self.manager.is_some() {
             return self.manager_key(event);
         }
+        if self.settings_panel.is_some() && self.settings_key(&event.logical_key) {
+            return;
+        }
+        // While the panel is open, only a setting being edited takes text.
+        if self
+            .settings_panel
+            .as_ref()
+            .is_some_and(|panel| panel.editing.is_none())
+            && !self.modifiers.control_key()
+        {
+            return;
+        }
         let control = self.modifiers.control_key();
         let shift = self.modifiers.shift_key();
         let alt = self.modifiers.alt_key();
@@ -1562,7 +1659,12 @@ impl App {
             Key::Character(text) if control => {
                 match text.to_lowercase().as_str() {
                     "t" => self.open_prompt(),
-                    "f" if !welcome => self.open_find(None),
+                    "f" if !welcome => {
+                        self.close_switcher();
+                        self.open_find(None);
+                    }
+                    "k" if !welcome => self.open_switcher(),
+                    "," if !welcome => self.open_settings(),
                     "w" if !welcome => {
                         let index = self.networks[self.active].active;
                         self.close_buffer(index);
@@ -1575,6 +1677,7 @@ impl App {
                     "j" if !welcome => {
                         self.close_find();
                         self.close_channels();
+                        self.close_switcher();
                         self.start_join();
                     }
                     "c" => self.copy(),
@@ -1597,7 +1700,12 @@ impl App {
             Key::Named(NamedKey::ArrowUp) if alt && !welcome => return self.cycle_buffer(-1),
             Key::Named(NamedKey::ArrowDown) if alt && !welcome => return self.cycle_buffer(1),
             Key::Named(NamedKey::Tab) if control => return self.cycle(if shift { -1 } else { 1 }),
-            Key::Named(NamedKey::Tab) if !welcome && self.find.is_none() && !self.browsing() => {
+            Key::Named(NamedKey::Tab)
+                if !welcome
+                    && self.find.is_none()
+                    && self.switcher.is_none()
+                    && !self.browsing() =>
+            {
                 return self.complete(shift);
             }
             Key::Named(NamedKey::PageDown) if control => return self.cycle(1),
@@ -1616,6 +1724,23 @@ impl App {
                 return self.mark_body();
             }
             Key::Named(NamedKey::Escape) if self.prompt_open => return self.close_prompt(),
+            // The quick switcher: Up, Down and Tab choose, Enter shows.
+            Key::Named(NamedKey::Escape) if self.switcher.is_some() => {
+                return self.close_switcher();
+            }
+            Key::Named(NamedKey::Enter) if self.switcher.is_some() => {
+                self.switcher_edited();
+                return self.switcher_choose(None);
+            }
+            Key::Named(NamedKey::ArrowUp) if self.switcher.is_some() => {
+                return self.switcher_move(-1);
+            }
+            Key::Named(NamedKey::ArrowDown) if self.switcher.is_some() => {
+                return self.switcher_move(1);
+            }
+            Key::Named(NamedKey::Tab) if self.switcher.is_some() => {
+                return self.switcher_move(if shift { -1 } else { 1 });
+            }
             // The find field: Enter and Up go to earlier matches,
             // Shift+Enter and Down to later ones.
             Key::Named(NamedKey::Escape) if !welcome && self.find.is_some() => {
@@ -1960,7 +2085,7 @@ impl App {
     fn follow(&mut self, target: Target) {
         match target {
             Target::Url(url) => {
-                if !crate::platform::open::open_url(&url) {
+                if !crate::platform::open::open_url(&url, &self.settings.link_command) {
                     self.say(
                         LineKind::Error,
                         "!",
@@ -2008,6 +2133,10 @@ impl App {
         let (saved_rows, suggested) = self.start_saved_rows();
         let trust_layout = self.trust_layout();
         let browsing = self.browsing();
+        let switching = self
+            .switcher_geometry()
+            .map(|geometry| (geometry, self.switcher_rows()));
+        let setting = self.settings_geometry();
         let channels_detail = self.channels_detail();
         let selected_row = self.selected_row();
         let current_match = self.current_match();
@@ -2037,8 +2166,11 @@ impl App {
             trust_hover,
             start_saved_hover,
             smart_filter,
+            settings,
             find,
             browser,
+            switcher,
+            settings_panel,
             ..
         } = self;
         // What repainted below the strip: overlays paint over it, and only
@@ -2063,6 +2195,7 @@ impl App {
         let width = size.width as f32 / scale;
         let focused = view.focused;
         let mut damage = Damage::default();
+        let mut caret = None;
         {
             let mut painter = Painter::new(&mut view.canvas, text, scale);
             if dirty.strip {
@@ -2232,7 +2365,11 @@ impl App {
                     *chat_frame = ChatFrame::default();
                     damage.add(regions.chat.snap(scale));
                 } else if dirty.body || dirty.chat || dirty.scrolled {
-                    let scrolled = !dirty.body && !dirty.chat && menu.is_none();
+                    let scrolled = !dirty.body
+                        && !dirty.chat
+                        && menu.is_none()
+                        && switcher.is_none()
+                        && settings_panel.is_none();
                     let state = &mut network.state;
                     let buffer = &mut state.buffers[network.active];
                     let chat = ChatView {
@@ -2244,6 +2381,7 @@ impl App {
                             label_chars: buffer.label_chars,
                             filter: *smart_filter,
                             loading: buffer.history.loading,
+                            seconds: settings.seconds,
                         },
                         anchor: buffer.anchor,
                         selection: selection.map(|s| chat_view::ordered(s.anchor, s.focus)),
@@ -2281,7 +2419,40 @@ impl App {
                         (input.width - 24.0).max(0.0),
                         (input.height - 16.0).max(0.0),
                     );
-                    if let Some(find) = find.as_mut() {
+                    caret = Some(if let Some(panel) = settings_panel.as_mut() {
+                        let (prompt, placeholder) = match panel.editing {
+                            Some(key) => (
+                                format!(
+                                    "{}\u{203a}",
+                                    crate::ui::settings::label(key).to_uppercase()
+                                ),
+                                "Separated by commas · Enter saves · Esc cancels",
+                            ),
+                            None => (
+                                String::from("SETTINGS\u{203a}"),
+                                "\u{2191}\u{2193} choose · Enter or Space changes · Esc closes",
+                            ),
+                        };
+                        paint_input(
+                            &mut painter,
+                            field,
+                            &mut panel.editor,
+                            &prompt,
+                            placeholder,
+                            focused,
+                            None,
+                        )
+                    } else if let Some(switcher) = switcher.as_mut() {
+                        paint_input(
+                            &mut painter,
+                            field,
+                            &mut switcher.editor,
+                            "SWITCH\u{203a}",
+                            "Buffer or network · Enter shows it · Esc closes",
+                            focused,
+                            None,
+                        )
+                    } else if let Some(find) = find.as_mut() {
                         let placeholder = format!(
                             "Find in {shown_name} · Enter: earlier · Shift+Enter: later · Esc closes"
                         );
@@ -2294,7 +2465,7 @@ impl App {
                             &placeholder,
                             focused,
                             note,
-                        );
+                        )
                     } else if let Some(browser) = browser.as_mut().filter(|_| browsing) {
                         let note = network
                             .state
@@ -2310,7 +2481,7 @@ impl App {
                             "Channel name or topic",
                             focused,
                             note,
-                        );
+                        )
                     } else {
                         let prompt = format!("{}\u{203a}", network.state.nick);
                         let buffer = network.buffer();
@@ -2327,8 +2498,8 @@ impl App {
                             &placeholder,
                             focused,
                             None,
-                        );
-                    }
+                        )
+                    });
                     damage.add(input.snap(scale));
                 }
                 if (dirty.body || dirty.nicks)
@@ -2365,6 +2536,42 @@ impl App {
                     && rect.y < reach.bottom()
                     && reach.y < rect.bottom()
             };
+            if let (Some(geometry), Some(panel)) = (
+                setting.as_ref().filter(|_| !welcome),
+                settings_panel.as_ref(),
+            ) {
+                for rect in repainted
+                    .iter()
+                    .filter(|rect| meets(rect, geometry.damage()))
+                {
+                    painter.save_clip(*rect);
+                    crate::ui::settings::paint_settings(
+                        &mut painter,
+                        geometry,
+                        settings,
+                        panel.selected,
+                        panel.editing.is_some(),
+                    );
+                    painter.restore();
+                }
+            }
+            if let Some((geometry, (rows, total))) = switching.as_ref().filter(|_| !welcome) {
+                let selected = switcher.as_ref().map_or(0, |switcher| switcher.selected);
+                for rect in repainted
+                    .iter()
+                    .filter(|rect| meets(rect, geometry.damage()))
+                {
+                    painter.save_clip(*rect);
+                    crate::ui::switcher::paint_switcher(
+                        &mut painter,
+                        geometry,
+                        rows,
+                        selected,
+                        *total,
+                    );
+                    painter.restore();
+                }
+            }
             if let Some(menu) = menu.as_ref().filter(|_| !welcome) {
                 for rect in repainted
                     .iter()
@@ -2388,6 +2595,16 @@ impl App {
                 }
             }
         }
+        // The input method's candidates go by the caret.
+        if let Some(caret) = caret
+            && view.ime_area != Some(caret)
+        {
+            view.ime_area = Some(caret);
+            view.window.set_ime_cursor_area(
+                winit::dpi::LogicalPosition::new(caret.x, caret.y),
+                LogicalSize::new(caret.width, caret.height),
+            );
+        }
         let painted = started.elapsed();
         match view.presenter.present(&view.window, &view.canvas, &damage) {
             Ok(presented) => {
@@ -2402,6 +2619,15 @@ impl App {
                         damage.rects().len(),
                         presented.age,
                         presented.copied,
+                    );
+                }
+                if self.trace
+                    && self.frames == 0
+                    && let Some(launched) = self.launched
+                {
+                    eprintln!(
+                        "first frame presented {:.1} ms after launch",
+                        launched.elapsed().as_secs_f64() * 1e3
                     );
                 }
                 self.last_frame = Some(total);
@@ -2546,7 +2772,10 @@ impl ApplicationHandler<AppEvent> for App {
     ) {
         match event {
             WindowEvent::CloseRequested => self.close_window(),
-            WindowEvent::RedrawRequested => self.redraw(),
+            WindowEvent::RedrawRequested => {
+                self.redraw();
+                self.ask_for_faces();
+            }
             WindowEvent::Resized(_) => self.mark_all(),
             WindowEvent::ScaleFactorChanged { scale_factor, .. } => {
                 if let Some(view) = &mut self.view {
@@ -2590,6 +2819,11 @@ impl ApplicationHandler<AppEvent> for App {
                 {
                     self.menu_pointer_moved(point);
                     self.set_cursor(CursorIcon::Default);
+                } else if let Some(point) = self.view.as_ref().map(|view| view.pointer)
+                    && self.switcher.is_some()
+                    && self.switcher_pointer_moved(point)
+                {
+                    self.set_cursor(CursorIcon::Pointer);
                 } else if !self.chrome_pointer_moved() {
                     if self.manager.is_some() {
                         self.manager_pointer_moved();
@@ -2622,6 +2856,18 @@ impl ApplicationHandler<AppEvent> for App {
                 if state == ElementState::Pressed
                     && let Some(point) = self.view.as_ref().map(|view| view.pointer)
                     && self.menu_pointer_pressed(point, button == MouseButton::Right)
+                {
+                    return;
+                }
+                if state == ElementState::Pressed
+                    && let Some(point) = self.view.as_ref().map(|view| view.pointer)
+                    && self.switcher_pointer_pressed(point)
+                {
+                    return;
+                }
+                if state == ElementState::Pressed
+                    && let Some(point) = self.view.as_ref().map(|view| view.pointer)
+                    && self.settings_pointer_pressed(point)
                 {
                     return;
                 }
@@ -2670,8 +2916,23 @@ impl ApplicationHandler<AppEvent> for App {
                 is_synthetic: false,
                 ..
             } => self.key(&event),
+            // An input method's composition shows at the caret until it
+            // commits (DESIGN.md §8.8).
+            WindowEvent::Ime(Ime::Preedit(text, cursor)) => {
+                self.editor().preedit = (!text.is_empty()).then_some(Preedit { text, cursor });
+                self.mark_input();
+            }
             WindowEvent::Ime(Ime::Commit(text)) => {
-                self.editor().insert(&text);
+                let editor = self.editor();
+                editor.preedit = None;
+                editor.insert(&text);
+                self.mark_input();
+                if self.manager.is_some() {
+                    self.manager_edited();
+                }
+            }
+            WindowEvent::Ime(Ime::Disabled) => {
+                self.editor().preedit = None;
                 self.mark_input();
             }
             _ => {}
@@ -2697,11 +2958,14 @@ impl ApplicationHandler<AppEvent> for App {
         while let Some(request) = self.instance_inbox.next() {
             self.handed_over(request);
         }
+        self.fonts_arrived();
+        self.ask_for_faces();
         // What was typed into the find field or the channel filter applies,
         // a search waiting for history carries on, and the channel list
         // takes its next slice of work.
         self.find_edited();
         self.find_resume();
+        self.switcher_edited();
         self.channels_edited();
         self.step_channels(deadline);
         if self.quit {

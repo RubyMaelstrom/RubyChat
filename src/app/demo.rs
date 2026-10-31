@@ -192,6 +192,12 @@ impl App {
                         "ruby: did the TLS rewrite land yet? the old code path still shows up in my traces",
                     ),
                     (8, Message, "ruby", "dave: yes, it went in this morning"),
+                    (
+                        7,
+                        Message,
+                        "grace",
+                        "Grüße aus Zürich · привет · 你好，世界 · こんにちは · 안녕하세요 · ✓ → ∞ 🎉🦀",
+                    ),
                     (6, Event, "•", "rustbot sets mode +v erin"),
                     (
                         3,

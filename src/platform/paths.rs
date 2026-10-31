@@ -31,6 +31,68 @@ pub fn data_dir() -> Option<PathBuf> {
     }
 }
 
+/// `$XDG_CACHE_HOME/rubychat`: what can be worked out again, such as the
+/// font index.
+pub fn cache_dir() -> Option<PathBuf> {
+    #[cfg(windows)]
+    {
+        windows_dir("LOCALAPPDATA").map(|dir| dir.join("cache"))
+    }
+    #[cfg(not(windows))]
+    {
+        xdg_dir("XDG_CACHE_HOME", ".cache")
+    }
+}
+
+/// Where fonts are installed, most important first: `fonts` under
+/// `$XDG_DATA_HOME` and each of `$XDG_DATA_DIRS` (by default
+/// `/usr/local/share/:/usr/share/`), then the old `~/.fonts`; the system
+/// and per-user font folders on Windows.
+pub fn font_dirs() -> Vec<PathBuf> {
+    #[cfg(windows)]
+    {
+        let mut dirs = Vec::new();
+        if let Some(windows) = std::env::var_os("WINDIR") {
+            dirs.push(PathBuf::from(windows).join("Fonts"));
+        }
+        if let Some(local) = std::env::var_os("LOCALAPPDATA") {
+            dirs.push(PathBuf::from(local).join("Microsoft/Windows/Fonts"));
+        }
+        dirs
+    }
+    #[cfg(not(windows))]
+    {
+        let home = std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .filter(|home| home.is_absolute());
+        let mut dirs = Vec::new();
+        let data_home = std::env::var_os("XDG_DATA_HOME")
+            .map(PathBuf::from)
+            .filter(|path| path.is_absolute())
+            .or_else(|| home.as_ref().map(|home| home.join(".local/share")));
+        dirs.extend(data_home.map(|dir| dir.join("fonts")));
+        let data_dirs = std::env::var("XDG_DATA_DIRS")
+            .ok()
+            .filter(|dirs| !dirs.is_empty())
+            .unwrap_or_else(|| String::from("/usr/local/share/:/usr/share/"));
+        dirs.extend(
+            data_dirs
+                .split(':')
+                .map(PathBuf::from)
+                .filter(|path| path.is_absolute())
+                .map(|dir| dir.join("fonts")),
+        );
+        dirs.extend(home.map(|home| home.join(".fonts")));
+        let mut seen = Vec::new();
+        dirs.retain(|dir| {
+            let new = !seen.contains(dir);
+            seen.push(dir.clone());
+            new
+        });
+        dirs
+    }
+}
+
 /// `$XDG_CONFIG_HOME/rubychat`: settings and saved networks.
 pub fn config_dir() -> Option<PathBuf> {
     #[cfg(windows)]

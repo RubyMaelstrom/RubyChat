@@ -34,6 +34,8 @@ pub enum Document {
     Session,
     /// `$XDG_CONFIG_HOME/rubychat/sts.toml`: STS policies.
     Sts,
+    /// `$XDG_CONFIG_HOME/rubychat/settings.toml`: settings.
+    Settings,
 }
 
 impl Document {
@@ -45,6 +47,7 @@ impl Document {
             Document::KnownHosts => paths::config_dir().map(|dir| dir.join("known_hosts")),
             Document::Session => paths::state_dir().map(|dir| dir.join("session.toml")),
             Document::Sts => paths::config_dir().map(|dir| dir.join("sts.toml")),
+            Document::Settings => paths::config_dir().map(|dir| dir.join("settings.toml")),
         }
     }
 

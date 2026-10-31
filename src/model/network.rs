@@ -57,6 +57,27 @@ impl Applied {
     }
 }
 
+/// Whether `text` holds `word` on its own: not inside a longer nick or
+/// word.
+fn contains_word(text: &str, word: &str) -> bool {
+    if word.is_empty() {
+        return false;
+    }
+    let word_char = |c: char| c.is_alphanumeric() || "-_[]{}\\|`^".contains(c);
+    let mut start = 0;
+    while let Some(found) = text[start..].find(word) {
+        let at = start + found;
+        let end = at + word.len();
+        let before = text[..at].chars().next_back();
+        let after = text[end..].chars().next();
+        if !before.is_some_and(word_char) && !after.is_some_and(word_char) {
+            return true;
+        }
+        start = at + word.chars().next().map_or(1, char::len_utf8);
+    }
+    false
+}
+
 /// Whether someone who last spoke at `spoke` (0: never) is quiet at
 /// `time`.
 fn quiet(spoke: i64, time: i64) -> bool {
@@ -199,6 +220,8 @@ pub struct NetworkState {
     /// The message being applied's ID: lines it adds carry it, so history
     /// that repeats them is recognized (IRCv3 message-ids).
     message_id: Option<Box<str>>,
+    /// Words that highlight a line besides your nick, casefolded.
+    highlight_words: Vec<String>,
 }
 
 impl NetworkState {
@@ -226,6 +249,7 @@ impl NetworkState {
             ignores: Vec::new(),
             channels: None,
             message_id: None,
+            highlight_words: Vec::new(),
         }
     }
 
@@ -335,22 +359,18 @@ impl NetworkState {
     pub fn mentions(&self, text: &str) -> bool {
         let text = self.fold(&strip(text));
         let nick = self.fold(&self.nick);
-        if nick.is_empty() {
-            return false;
-        }
-        let nick_char = |c: char| c.is_alphanumeric() || "-_[]{}\\|`^".contains(c);
-        let mut start = 0;
-        while let Some(found) = text[start..].find(&nick) {
-            let at = start + found;
-            let end = at + nick.len();
-            let before = text[..at].chars().next_back();
-            let after = text[end..].chars().next();
-            if !before.is_some_and(nick_char) && !after.is_some_and(nick_char) {
-                return true;
-            }
-            start = at + nick.chars().next().map_or(1, char::len_utf8);
-        }
-        false
+        std::iter::once(&nick)
+            .chain(&self.highlight_words)
+            .any(|word| contains_word(&text, word))
+    }
+
+    /// Words that highlight a line besides your nick (the setting).
+    pub fn set_highlight_words(&mut self, words: &[String]) {
+        self.highlight_words = words
+            .iter()
+            .map(|word| self.fold(word.trim()))
+            .filter(|word| !word.is_empty())
+            .collect();
     }
 
     fn add(&mut self, index: usize, mut line: Line, applied: &mut Applied) {

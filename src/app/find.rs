@@ -134,6 +134,8 @@ impl App {
             return;
         }
         self.close_channels();
+        self.close_switcher();
+        self.close_settings();
         let find = self.find.get_or_insert_with(Find::default);
         match text {
             Some(text) => find.editor.set(text),
@@ -358,6 +360,7 @@ impl App {
             label_chars: buffer.label_chars,
             filter: self.smart_filter,
             loading: buffer.history.loading,
+            seconds: self.settings.seconds,
         };
         buffer.anchor = chat_view::scroll(
             &mut self.text,

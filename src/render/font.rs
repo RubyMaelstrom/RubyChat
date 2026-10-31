@@ -1,13 +1,15 @@
 //! Font faces. JetBrains Mono Regular and Bold are embedded (OFL; see
 //! `assets/fonts/`) so RubyChat looks the same on every machine; the Latin
 //! glyphs match the JetBrainsMono Nerd Font that trust-desktop's chrome uses.
-//! Fallback faces from the system arrive with the fallback index (DESIGN.md
-//! §9.5).
+//! Fallback faces come from the system, through the fallback index (DESIGN.md
+//! §9.5), and are loaded on the font worker.
 
 use harfrust::{Shaper, ShaperData};
 use skrifa::instance::{LocationRef, Size};
 use skrifa::outline::OutlineGlyphCollection;
-use skrifa::{FontRef, GlyphId, MetadataProvider};
+use skrifa::{FontRef, GlyphId, MetadataProvider, Tag};
+
+use super::fallback::Coverage;
 
 pub static JETBRAINS_MONO_REGULAR: &[u8] =
     include_bytes!("../../assets/fonts/JetBrainsMono-Regular.ttf");
@@ -37,6 +39,10 @@ pub struct Face {
     /// Extra space between lines, in font units.
     pub line_gap: f32,
     pub monospace: bool,
+    /// Draws from color bitmaps (CBDT) rather than outlines.
+    pub color: bool,
+    /// The characters it maps.
+    pub coverage: Coverage,
     /// Glyph and advance (font units) of each printable ASCII character.
     ascii: [(u16, f32); 95],
 }
@@ -44,7 +50,13 @@ pub struct Face {
 impl Face {
     /// A face from font data that lives as long as the process.
     pub fn new(data: &'static [u8]) -> Option<Self> {
-        let font = FontRef::new(data).ok()?;
+        Self::from_index(data, 0)
+    }
+
+    /// Face `index` of a font file or collection that lives as long as the
+    /// process.
+    pub fn from_index(data: &'static [u8], index: u32) -> Option<Self> {
+        let font = FontRef::from_index(data, index).ok()?;
         let outlines = font.outline_glyphs();
         // Shaping tables live as long as the face, which is the process.
         let shaper_data: &'static ShaperData = Box::leak(Box::new(ShaperData::new(&font)));
@@ -60,6 +72,13 @@ impl Face {
                 glyph_metrics.advance_width(glyph).unwrap_or(0.0),
             );
         }
+        let coverage = Coverage::from_codepoints(
+            charmap
+                .mappings()
+                .filter(|(_, glyph)| *glyph != GlyphId::NOTDEF)
+                .map(|(codepoint, _)| codepoint),
+        );
+        let color = font.table_data(Tag::new(b"CBDT")).is_some();
         Some(Self {
             outlines,
             shaper,
@@ -68,6 +87,8 @@ impl Face {
             descent: -metrics.descent,
             line_gap: metrics.leading,
             monospace: metrics.is_monospace,
+            color,
+            coverage,
             ascii,
         })
     }
@@ -98,6 +119,16 @@ mod tests {
             let (i, i_advance) = face.ascii(b'i');
             assert!(m != 0 && i != 0 && m != i);
             assert_eq!(m_advance, i_advance, "monospaced");
+            assert!(face.coverage.contains('M') && face.coverage.contains('\u{e9}'));
+            assert!(!face.coverage.contains('\u{4e00}'));
+            assert!(!face.color);
         }
+    }
+
+    /// Faces must cross to the UI thread from the font worker.
+    #[test]
+    fn faces_travel_between_threads() {
+        fn send<T: Send>() {}
+        send::<Face>();
     }
 }
